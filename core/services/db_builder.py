@@ -1,0 +1,975 @@
+"""
+[L-Service] 统一数据库构建模块（新版本）
+
+从所有 JSON 源文件构建单一 warframe.db 数据库。
+从 data/build_warframe_db.py 迁移而来。
+
+数据源:
+  - external/warframe-items_sparse/data/json/All.json   → 全物品数据
+  - external/warframe-items_sparse/data/json/i18n.json  → 物品多语言翻译
+  - external/warframe-drop-data_sparse/data/all.json    → 掉落数据（DE 官方）
+  - external/warframe-i18n_sparse/dict.en.json          → 游戏术语英文
+  - external/warframe-i18n_sparse/dict.zh.json          → 游戏术语中文
+
+输出: data/warframe.db
+"""
+
+import json
+import re
+import sqlite3
+import shutil
+import time
+import urllib.request
+import urllib.error
+from pathlib import Path
+from typing import Optional, Callable
+
+from pypinyin import lazy_pinyin, Style
+
+# ============================================================
+# 路径常量
+# ============================================================
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DATA_DIR = _PROJECT_ROOT / "data"
+EXTERNAL_DIR = _PROJECT_ROOT / "external"
+
+ALL_JSON = EXTERNAL_DIR / "warframe-items_sparse" / "data" / "json" / "All.json"
+I18N_JSON = EXTERNAL_DIR / "warframe-items_sparse" / "data" / "json" / "i18n.json"
+DROP_DATA_JSON = EXTERNAL_DIR / "warframe-drop-data_sparse" / "data" / "all.json"
+DICT_EN_JSON = EXTERNAL_DIR / "warframe-i18n_sparse" / "dict.en.json"
+DICT_ZH_JSON = EXTERNAL_DIR / "warframe-i18n_sparse" / "dict.zh.json"
+
+DB_PATH = DATA_DIR / "warframe.db"
+
+# ============================================================
+# Schema
+# ============================================================
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS items (
+    unique_name         TEXT PRIMARY KEY,
+    name                TEXT NOT NULL,
+    zh_name             TEXT DEFAULT '',
+    type                TEXT NOT NULL,
+    category            TEXT DEFAULT '',
+    tradable            INTEGER DEFAULT 0,
+    masterable          INTEGER DEFAULT 0,
+    is_prime            INTEGER DEFAULT 0,
+    description         TEXT DEFAULT '',
+    description_zh      TEXT DEFAULT '',
+    image_name          TEXT DEFAULT '',
+    exclude_from_codex  INTEGER DEFAULT 0,
+    show_in_inventory   INTEGER DEFAULT 1,
+    build_price             INTEGER,
+    build_time              INTEGER,
+    skip_build_time_price   INTEGER,
+    build_quantity          INTEGER DEFAULT 1,
+    consume_on_build        INTEGER DEFAULT 1,
+    market_cost             INTEGER,
+    bp_cost                 INTEGER,
+    introduced              TEXT DEFAULT '',
+    release_date            TEXT DEFAULT '',
+    wikia_url          TEXT DEFAULT '',
+    wiki_available      INTEGER DEFAULT 0,
+    zh_pinyin           TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_items_name ON items(name);
+CREATE INDEX IF NOT EXISTS idx_items_zh_name ON items(zh_name);
+CREATE INDEX IF NOT EXISTS idx_items_type ON items(type);
+CREATE INDEX IF NOT EXISTS idx_items_category ON items(category);
+CREATE INDEX IF NOT EXISTS idx_items_tradable ON items(tradable);
+CREATE INDEX IF NOT EXISTS idx_items_prime ON items(is_prime);
+CREATE INDEX IF NOT EXISTS idx_items_zh_pinyin ON items(zh_pinyin);
+
+CREATE TABLE IF NOT EXISTS item_type_attrs (
+    unique_name     TEXT PRIMARY KEY,
+    type            TEXT NOT NULL,
+    attrs           TEXT NOT NULL,
+    FOREIGN KEY (unique_name) REFERENCES items(unique_name) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_attrs_type ON item_type_attrs(type);
+
+CREATE TABLE IF NOT EXISTS item_abilities (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    unique_name     TEXT NOT NULL,
+    ability_index   INTEGER NOT NULL,
+    ability_unique  TEXT DEFAULT '',
+    name            TEXT NOT NULL,
+    description     TEXT DEFAULT '',
+    image_name      TEXT DEFAULT '',
+    FOREIGN KEY (unique_name) REFERENCES items(unique_name) ON DELETE CASCADE,
+    UNIQUE(unique_name, ability_index)
+);
+CREATE INDEX IF NOT EXISTS idx_abilities_item ON item_abilities(unique_name);
+
+CREATE TABLE IF NOT EXISTS item_attacks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    unique_name     TEXT NOT NULL,
+    attack_index    INTEGER NOT NULL,
+    attack_name     TEXT DEFAULT '',
+    crit_chance     REAL DEFAULT 0,
+    crit_mult       REAL DEFAULT 0,
+    status_chance   REAL DEFAULT 0,
+    shot_type       TEXT DEFAULT '',
+    speed           REAL DEFAULT 0,
+    charge_time     REAL DEFAULT 0,
+    damage_json     TEXT DEFAULT '',
+    pellet_count    INTEGER DEFAULT 1,
+    FOREIGN KEY (unique_name) REFERENCES items(unique_name) ON DELETE CASCADE,
+    UNIQUE(unique_name, attack_index)
+);
+CREATE INDEX IF NOT EXISTS idx_attacks_item ON item_attacks(unique_name);
+
+CREATE TABLE IF NOT EXISTS item_components (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent_name     TEXT NOT NULL,
+    component_name  TEXT NOT NULL,
+    component_unique TEXT DEFAULT '',
+    item_count      INTEGER DEFAULT 1,
+    tradable        INTEGER DEFAULT 0,
+    image_name      TEXT DEFAULT '',
+    FOREIGN KEY (parent_name) REFERENCES items(unique_name) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_components_parent ON item_components(parent_name);
+
+CREATE TABLE IF NOT EXISTS item_drops (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    unique_name     TEXT NOT NULL,
+    drop_type       TEXT DEFAULT '',
+    location        TEXT NOT NULL,
+    rarity          TEXT DEFAULT '',
+    chance          REAL DEFAULT 0,
+    FOREIGN KEY (unique_name) REFERENCES items(unique_name) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_drops_item ON item_drops(unique_name);
+CREATE INDEX IF NOT EXISTS idx_drops_location ON item_drops(location);
+
+CREATE TABLE IF NOT EXISTS item_patchlogs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    unique_name     TEXT NOT NULL,
+    patch_name      TEXT DEFAULT '',
+    patch_date      TEXT DEFAULT '',
+    patch_url       TEXT DEFAULT '',
+    additions       TEXT DEFAULT '',
+    changes         TEXT DEFAULT '',
+    fixes           TEXT DEFAULT '',
+    FOREIGN KEY (unique_name) REFERENCES items(unique_name) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_patchlogs_item ON item_patchlogs(unique_name);
+
+CREATE TABLE IF NOT EXISTS item_translations (
+    unique_name     TEXT NOT NULL,
+    lang            TEXT NOT NULL,
+    name            TEXT DEFAULT '',
+    description     TEXT DEFAULT '',
+    PRIMARY KEY (unique_name, lang),
+    FOREIGN KEY (unique_name) REFERENCES items(unique_name) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_trans_lang ON item_translations(lang);
+
+CREATE TABLE IF NOT EXISTS relics (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tier            TEXT NOT NULL,
+    relic_name      TEXT NOT NULL,
+    state           TEXT NOT NULL,
+    vaulted         INTEGER DEFAULT 0,
+    drop_data_id    TEXT DEFAULT '',
+    UNIQUE(tier, relic_name, state)
+);
+CREATE INDEX IF NOT EXISTS idx_relics_tier ON relics(tier);
+CREATE INDEX IF NOT EXISTS idx_relics_vaulted ON relics(vaulted);
+CREATE INDEX IF NOT EXISTS idx_relics_lookup ON relics(tier, relic_name);
+
+CREATE TABLE IF NOT EXISTS relic_rewards (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    relic_id        INTEGER NOT NULL,
+    item_name       TEXT NOT NULL,
+    item_unique     TEXT DEFAULT '',
+    rarity          TEXT NOT NULL,
+    chance          REAL NOT NULL DEFAULT 0,
+    drop_data_id    TEXT DEFAULT '',
+    wm_url_name     TEXT DEFAULT '',
+    FOREIGN KEY (relic_id) REFERENCES relics(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rewards_relic ON relic_rewards(relic_id);
+CREATE INDEX IF NOT EXISTS idx_rewards_item ON relic_rewards(item_name);
+CREATE INDEX IF NOT EXISTS idx_rewards_unique ON relic_rewards(item_unique);
+
+CREATE TABLE IF NOT EXISTS planets (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS mission_nodes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    planet_id       INTEGER NOT NULL,
+    node_name       TEXT NOT NULL,
+    game_mode       TEXT DEFAULT '',
+    is_event        INTEGER DEFAULT 0,
+    UNIQUE(planet_id, node_name),
+    FOREIGN KEY (planet_id) REFERENCES planets(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_nodes_planet ON mission_nodes(planet_id);
+CREATE INDEX IF NOT EXISTS idx_nodes_mode ON mission_nodes(game_mode);
+
+CREATE TABLE IF NOT EXISTS mission_rewards (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id         INTEGER NOT NULL,
+    rotation        TEXT DEFAULT '',
+    item_name       TEXT NOT NULL,
+    item_unique     TEXT DEFAULT '',
+    rarity          TEXT DEFAULT '',
+    chance          REAL DEFAULT 0,
+    drop_data_id    TEXT DEFAULT '',
+    FOREIGN KEY (node_id) REFERENCES mission_nodes(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_mrewards_node ON mission_rewards(node_id);
+CREATE INDEX IF NOT EXISTS idx_mrewards_item ON mission_rewards(item_name);
+CREATE INDEX IF NOT EXISTS idx_mrewards_rotation ON mission_rewards(node_id, rotation);
+
+CREATE TABLE IF NOT EXISTS mod_drops (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    mod_name        TEXT NOT NULL,
+    mod_unique      TEXT DEFAULT '',
+    enemy_name      TEXT NOT NULL,
+    enemy_mod_drop_chance REAL DEFAULT 0,
+    rarity          TEXT DEFAULT '',
+    chance          REAL DEFAULT 0,
+    drop_data_id    TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_moddrops_mod ON mod_drops(mod_name);
+CREATE INDEX IF NOT EXISTS idx_moddrops_enemy ON mod_drops(enemy_name);
+
+CREATE TABLE IF NOT EXISTS enemy_mod_tables (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    enemy_name      TEXT NOT NULL,
+    enemy_mod_drop_chance REAL DEFAULT 0,
+    mod_name        TEXT NOT NULL,
+    mod_unique      TEXT DEFAULT '',
+    rarity          TEXT DEFAULT '',
+    chance          REAL DEFAULT 0,
+    drop_data_id    TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_enemymod_enemy ON enemy_mod_tables(enemy_name);
+CREATE INDEX IF NOT EXISTS idx_enemymod_mod ON enemy_mod_tables(mod_name);
+
+CREATE TABLE IF NOT EXISTS blueprint_drops (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    blueprint_name  TEXT NOT NULL,
+    blueprint_unique TEXT DEFAULT '',
+    enemy_name      TEXT NOT NULL,
+    enemy_bp_drop_chance REAL DEFAULT 0,
+    rarity          TEXT DEFAULT '',
+    chance          REAL DEFAULT 0,
+    drop_data_id    TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_bpdrops_bp ON blueprint_drops(blueprint_name);
+CREATE INDEX IF NOT EXISTS idx_bpdrops_enemy ON blueprint_drops(enemy_name);
+
+CREATE TABLE IF NOT EXISTS enemy_bp_tables (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    enemy_name      TEXT NOT NULL,
+    enemy_bp_drop_chance REAL DEFAULT 0,
+    blueprint_name  TEXT NOT NULL,
+    blueprint_unique TEXT DEFAULT '',
+    rarity          TEXT DEFAULT '',
+    chance          REAL DEFAULT 0,
+    drop_data_id    TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_enemybp_enemy ON enemy_bp_tables(enemy_name);
+CREATE INDEX IF NOT EXISTS idx_enemybp_bp ON enemy_bp_tables(blueprint_name);
+
+CREATE TABLE IF NOT EXISTS sortie_rewards (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_name       TEXT NOT NULL,
+    item_unique     TEXT DEFAULT '',
+    rarity          TEXT DEFAULT '',
+    chance          REAL DEFAULT 0,
+    drop_data_id    TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_sortie_item ON sortie_rewards(item_name);
+
+CREATE TABLE IF NOT EXISTS bounty_rewards (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source          TEXT NOT NULL,
+    bounty_level    TEXT DEFAULT '',
+    rotation        TEXT DEFAULT '',
+    item_name       TEXT NOT NULL,
+    item_unique     TEXT DEFAULT '',
+    rarity          TEXT DEFAULT '',
+    chance          REAL DEFAULT 0,
+    drop_data_id    TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_bounty_source ON bounty_rewards(source);
+CREATE INDEX IF NOT EXISTS idx_bounty_item ON bounty_rewards(item_name);
+
+CREATE TABLE IF NOT EXISTS transient_rewards (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    objective_name  TEXT NOT NULL,
+    rotation        TEXT DEFAULT '',
+    item_name       TEXT NOT NULL,
+    item_unique     TEXT DEFAULT '',
+    rarity          TEXT DEFAULT '',
+    chance          REAL DEFAULT 0,
+    drop_data_id    TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_transient_obj ON transient_rewards(objective_name);
+CREATE INDEX IF NOT EXISTS idx_transient_item ON transient_rewards(item_name);
+
+CREATE TABLE IF NOT EXISTS key_rewards (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_name        TEXT NOT NULL,
+    rotation        TEXT DEFAULT '',
+    item_name       TEXT NOT NULL,
+    item_unique     TEXT DEFAULT '',
+    rarity          TEXT DEFAULT '',
+    chance          REAL DEFAULT 0,
+    drop_data_id    TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_keyrewards_key ON key_rewards(key_name);
+
+CREATE TABLE IF NOT EXISTS syndicate_rewards (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    syndicate_name  TEXT NOT NULL,
+    rotation        TEXT DEFAULT '',
+    item_name       TEXT NOT NULL,
+    item_unique     TEXT DEFAULT '',
+    rarity          TEXT DEFAULT '',
+    chance          REAL DEFAULT 0,
+    drop_data_id    TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_syndicate_name ON syndicate_rewards(syndicate_name);
+CREATE INDEX IF NOT EXISTS idx_syndicate_item ON syndicate_rewards(item_name);
+
+CREATE TABLE IF NOT EXISTS game_translations (
+    key             TEXT PRIMARY KEY,
+    en              TEXT NOT NULL,
+    zh              TEXT DEFAULT '',
+    category        TEXT DEFAULT '',
+    source          TEXT DEFAULT 'public-export-plus'
+);
+CREATE INDEX IF NOT EXISTS idx_gametrans_category ON game_translations(category);
+CREATE INDEX IF NOT EXISTS idx_gametrans_en ON game_translations(en);
+CREATE INDEX IF NOT EXISTS idx_gametrans_zh ON game_translations(zh);
+
+CREATE TABLE IF NOT EXISTS market_items (
+    id              INTEGER PRIMARY KEY,
+    slug            TEXT NOT NULL UNIQUE,
+    en_name         TEXT NOT NULL,
+    zh_name         TEXT DEFAULT '',
+    item_unique     TEXT DEFAULT '',
+    item_type       TEXT DEFAULT '',
+    is_tradable     INTEGER DEFAULT 0,
+    is_prime        INTEGER DEFAULT 0,
+    zh_pinyin       TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_mktitems_slug ON market_items(slug);
+CREATE INDEX IF NOT EXISTS idx_mktitems_en ON market_items(en_name);
+CREATE INDEX IF NOT EXISTS idx_mktitems_zh ON market_items(zh_name);
+CREATE INDEX IF NOT EXISTS idx_mktitems_unique ON market_items(item_unique);
+
+CREATE TABLE IF NOT EXISTS db_meta (
+    key             TEXT PRIMARY KEY,
+    value           TEXT NOT NULL
+);
+"""
+
+
+# ============================================================
+# 类型专属属性提取
+# ============================================================
+
+_COMMON_KEYS = frozenset({
+    'uniqueName', 'name', 'type', 'category', 'tradable', 'masterable',
+    'description', 'imageName', 'excludeFromCodex', 'showInInventory',
+    'buildPrice', 'buildTime', 'skipBuildTimePrice', 'buildQuantity',
+    'consumeOnBuild', 'marketCost', 'bpCost', 'introduced', 'releaseDate',
+    'wikiaUrl', 'wikiAvailable', 'wikiaThumbnail',
+    'abilities', 'attacks', 'components', 'drops', 'patchlogs',
+    'i18n', 'versions',
+})
+
+_SKIP_KEYS = frozenset({
+    'abilities', 'attacks', 'components', 'drops', 'patchlogs',
+    'i18n', 'versions', 'wikiaThumbnail',
+})
+
+
+def _safe_str(val, default='') -> str:
+    if val is None:
+        return default
+    if isinstance(val, (dict, list)):
+        return json.dumps(val, ensure_ascii=False)
+    return str(val)
+
+
+def _safe_int(val):
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_float(val):
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _extract_type_attrs(item: dict) -> dict:
+    attrs = {}
+    for k, v in item.items():
+        if k in _COMMON_KEYS or k in _SKIP_KEYS:
+            continue
+        if v is None:
+            continue
+        attrs[k] = v
+    return attrs
+
+
+def _build_name_map(items_data: list) -> dict:
+    """构建 name -> uniqueName 映射。"""
+    name_map = {}
+    for item in items_data:
+        name = item.get('name', '')
+        unique = item.get('uniqueName', '')
+        if name and unique and name not in name_map:
+            name_map[name] = unique
+    return name_map
+
+
+# ============================================================
+# 构建函数
+# ============================================================
+
+def build(
+    log_callback: Optional[Callable] = None,
+    progress_callback: Optional[Callable] = None,
+    skip_wm: bool = False,
+    close_connections_fn: Optional[Callable] = None,
+) -> dict:
+    """
+    构建完整的 warframe.db 数据库。
+
+    Args:
+        log_callback: 日志回调 (message)
+        progress_callback: 进度回调 (step, current, total)
+        skip_wm: 是否跳过 WM API 拉取
+        close_connections_fn: 关闭缓存连接的函数
+    Returns:
+        统计信息字典
+    """
+    stats = {}
+    start_time = time.time()
+
+    def _log(msg: str):
+        if log_callback:
+            log_callback(msg)
+
+    def _progress(step: str, cur: int = 0, total: int = 0):
+        if progress_callback:
+            progress_callback(step, cur, total)
+
+    # ── 构建到临时文件 ──
+    _TMP_DB = DB_PATH.with_suffix('.db.new')
+    if _TMP_DB.exists():
+        try:
+            _TMP_DB.unlink()
+        except OSError:
+            pass
+
+    conn = sqlite3.connect(str(_TMP_DB))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    cur = conn.cursor()
+
+    # ── 创建 Schema ──
+    _log("创建数据库表结构...")
+    cur.executescript(SCHEMA_SQL)
+    conn.commit()
+
+    name_map = {}
+    relic_vaulted_map = {}
+
+    # ================================================================
+    # Step 1: 解析 All.json
+    # ================================================================
+    _log("[1/6] 解析 All.json...")
+    if ALL_JSON.exists():
+        with open(ALL_JSON, 'r', encoding='utf-8') as f:
+            all_items = json.load(f)
+        name_map = _build_name_map(all_items)
+        _log(f"  加载 {len(all_items)} 条物品数据")
+
+        for item in all_items:
+            if item.get('category') == 'Relics' and 'vaulted' in item:
+                parts = item.get('name', '').rsplit(' ', 2)
+                if len(parts) >= 3:
+                    tier, rname, state = parts[0], parts[1], parts[2]
+                    key = (tier, rname)
+                    if key not in relic_vaulted_map or not item['vaulted']:
+                        relic_vaulted_map[key] = 1 if item['vaulted'] else 0
+        _log(f"  遗物 vaulted 映射: {len(relic_vaulted_map)} 个遗物")
+
+        item_rows = []
+        attr_rows = []
+        ability_rows = []
+        attack_rows = []
+        component_rows = []
+        drop_rows = []
+        patchlog_rows = []
+
+        for item in all_items:
+            unique = item.get('uniqueName', '')
+            if not unique:
+                continue
+
+            is_prime = 1 if item.get('isPrime') or 'Prime' in item.get('name', '') else 0
+            item_rows.append((
+                unique, _safe_str(item.get('name', '')), '', _safe_str(item.get('type', '')),
+                _safe_str(item.get('category', '')), 1 if item.get('tradable') else 0,
+                1 if item.get('masterable') else 0, is_prime,
+                _safe_str(item.get('description', '')), '', _safe_str(item.get('imageName', '')),
+                1 if item.get('excludeFromCodex') else 0,
+                1 if item.get('showInInventory', True) else 0,
+                _safe_int(item.get('buildPrice')), _safe_int(item.get('buildTime')),
+                _safe_int(item.get('skipBuildTimePrice')),
+                _safe_int(item.get('buildQuantity', 1)),
+                1 if item.get('consumeOnBuild', True) else 0,
+                _safe_int(item.get('marketCost')), _safe_int(item.get('bpCost')),
+                _safe_str(item.get('introduced', '')), _safe_str(item.get('releaseDate', '')),
+                _safe_str(item.get('wikiaUrl', '')), 1 if item.get('wikiAvailable') else 0,
+            ))
+
+            attrs = _extract_type_attrs(item)
+            if attrs:
+                attr_rows.append((unique, item.get('type', ''), json.dumps(attrs, ensure_ascii=False)))
+
+            for idx, ab in enumerate(item.get('abilities', [])):
+                ability_rows.append((unique, idx, _safe_str(ab.get('uniqueName', '')),
+                    _safe_str(ab.get('name', '')), _safe_str(ab.get('description', '')),
+                    _safe_str(ab.get('imageName', ''))))
+            for idx, atk in enumerate(item.get('attacks', [])):
+                pellet = atk.get('pellet', {})
+                attack_rows.append((unique, idx, _safe_str(atk.get('name', '')),
+                    _safe_float(atk.get('crit_chance', 0)) or 0,
+                    _safe_float(atk.get('crit_mult', 0)) or 0,
+                    _safe_float(atk.get('status_chance', 0)) or 0,
+                    _safe_str(atk.get('shot_type', '')), _safe_float(atk.get('speed', 0)) or 0,
+                    _safe_float(atk.get('charge_time', 0)) or 0,
+                    json.dumps(atk.get('damage', {}), ensure_ascii=False) if atk.get('damage') else '',
+                    _safe_int(pellet.get('count', 1)) if pellet else 1))
+            for comp in item.get('components', []):
+                component_rows.append((unique, _safe_str(comp.get('name', '')),
+                    _safe_str(comp.get('uniqueName', '')),
+                    _safe_int(comp.get('itemCount', 1)) or 1,
+                    1 if comp.get('tradable') else 0, _safe_str(comp.get('imageName', ''))))
+            for drop in item.get('drops', []):
+                drop_rows.append((unique, _safe_str(drop.get('type', '')),
+                    _safe_str(drop.get('location', '')), _safe_str(drop.get('rarity', '')),
+                    _safe_float(drop.get('chance', 0)) or 0))
+            for pl in item.get('patchlogs', []):
+                patchlog_rows.append((unique, _safe_str(pl.get('name', '')),
+                    _safe_str(pl.get('date', '')), _safe_str(pl.get('url', '')),
+                    _safe_str(pl.get('additions', '')), _safe_str(pl.get('changes', '')),
+                    _safe_str(pl.get('fixes', ''))))
+
+        cur.executemany("""INSERT OR IGNORE INTO items (
+            unique_name, name, zh_name, type, category, tradable, masterable, is_prime,
+            description, description_zh, image_name, exclude_from_codex, show_in_inventory,
+            build_price, build_time, skip_build_time_price, build_quantity, consume_on_build,
+            market_cost, bp_cost, introduced, release_date, wikia_url, wiki_available
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", item_rows)
+        cur.executemany("INSERT OR IGNORE INTO item_type_attrs (unique_name, type, attrs) VALUES (?,?,?)", attr_rows)
+        cur.executemany("INSERT OR IGNORE INTO item_abilities (unique_name, ability_index, ability_unique, name, description, image_name) VALUES (?,?,?,?,?,?)", ability_rows)
+        cur.executemany("INSERT OR IGNORE INTO item_attacks (unique_name, attack_index, attack_name, crit_chance, crit_mult, status_chance, shot_type, speed, charge_time, damage_json, pellet_count) VALUES (?,?,?,?,?,?,?,?,?,?,?)", attack_rows)
+        cur.executemany("INSERT OR IGNORE INTO item_components (parent_name, component_name, component_unique, item_count, tradable, image_name) VALUES (?,?,?,?,?,?)", component_rows)
+        cur.executemany("INSERT OR IGNORE INTO item_drops (unique_name, drop_type, location, rarity, chance) VALUES (?,?,?,?,?)", drop_rows)
+        cur.executemany("INSERT OR IGNORE INTO item_patchlogs (unique_name, patch_name, patch_date, patch_url, additions, changes, fixes) VALUES (?,?,?,?,?,?,?)", patchlog_rows)
+
+        conn.commit()
+        stats['items'] = len(item_rows)
+        stats['type_attrs'] = len(attr_rows)
+        stats['abilities'] = len(ability_rows)
+        stats['attacks'] = len(attack_rows)
+        stats['components'] = len(component_rows)
+        stats['drops'] = len(drop_rows)
+        stats['patchlogs'] = len(patchlog_rows)
+        _log(f"  items={len(item_rows)}, attrs={len(attr_rows)}, abilities={len(ability_rows)}, attacks={len(attack_rows)}")
+    else:
+        _log(f"  [!] All.json 不存在: {ALL_JSON}")
+
+    # ================================================================
+    # Step 2: i18n.json → 翻译 + 回填中文
+    # ================================================================
+    _log("[2/6] 解析 i18n.json...")
+    if I18N_JSON.exists():
+        with open(I18N_JSON, 'r', encoding='utf-8') as f:
+            i18n_data = json.load(f)
+        _log(f"  加载 {len(i18n_data)} 条翻译数据")
+
+        trans_rows = []
+        zh_updates = []
+
+        for unique_name, translations in i18n_data.items():
+            if not isinstance(translations, dict):
+                continue
+            for lang, texts in translations.items():
+                if not isinstance(texts, dict):
+                    continue
+                trans_rows.append((unique_name, lang,
+                    _safe_str(texts.get('name', '')), _safe_str(texts.get('description', ''))))
+                if lang == 'zh':
+                    zh_name = _safe_str(texts.get('name', ''))
+                    zh_desc = _safe_str(texts.get('description', ''))
+                    if zh_name or zh_desc:
+                        zh_updates.append((zh_name, zh_desc, unique_name))
+
+        cur.executemany("INSERT OR IGNORE INTO item_translations (unique_name, lang, name, description) VALUES (?,?,?,?)", trans_rows)
+        cur.executemany("UPDATE items SET zh_name=?, description_zh=? WHERE unique_name=? AND (zh_name='' OR zh_name IS NULL)", zh_updates)
+        conn.commit()
+
+        stats['translations'] = len(trans_rows)
+        stats['zh_backfilled'] = len([u for u in zh_updates if u[0]])
+        _log(f"  translations={len(trans_rows)}, zh_backfilled={stats['zh_backfilled']}")
+
+        # 拼音生成
+        py_rows = conn.execute(
+            "SELECT unique_name, zh_name FROM items WHERE zh_name IS NOT NULL AND zh_name != ''"
+        ).fetchall()
+        py_updates = []
+        for row in py_rows:
+            py_str = ''.join(lazy_pinyin(row[1], style=Style.NORMAL))
+            if py_str:
+                py_updates.append((py_str.lower(), row[0]))
+        cur.executemany("UPDATE items SET zh_pinyin=? WHERE unique_name=?", py_updates)
+        conn.commit()
+        stats['pinyin_generated'] = len(py_updates)
+        _log(f"  pinyin={len(py_updates)}")
+    else:
+        _log(f"  [!] i18n.json 不存在: {I18N_JSON}")
+
+    # ================================================================
+    # Step 3: 掉落数据 all.json
+    # ================================================================
+    _log("[3/6] 解析 all.json (掉落数据)...")
+    if DROP_DATA_JSON.exists():
+        with open(DROP_DATA_JSON, 'r', encoding='utf-8') as f:
+            drop_data = json.load(f)
+
+        # 3a: relics
+        relic_rows = []
+        reward_rows = []
+        relic_id_map = {}
+
+        for relic in drop_data.get('relics', []):
+            tier = relic.get('tier', '')
+            rname = relic.get('relicName', '')
+            state = relic.get('state', '')
+            did = relic.get('_id', '')
+            vaulted = relic_vaulted_map.get((tier, rname), 0)
+            cur.execute("INSERT OR IGNORE INTO relics (tier, relic_name, state, vaulted, drop_data_id) VALUES (?,?,?,?,?)",
+                        (tier, rname, state, vaulted, did))
+            row = cur.execute("SELECT id FROM relics WHERE tier=? AND relic_name=? AND state=?", (tier, rname, state)).fetchone()
+            if row:
+                relic_id = row[0]
+                relic_id_map[(tier, rname, state)] = relic_id
+                for rw in relic.get('rewards', []):
+                    reward_rows.append((relic_id, rw.get('itemName', ''), name_map.get(rw.get('itemName', ''), ''),
+                        rw.get('rarity', ''), rw.get('chance', 0), rw.get('_id', ''), ''))
+
+        cur.executemany("""INSERT OR IGNORE INTO relic_rewards
+            (relic_id, item_name, item_unique, rarity, chance, drop_data_id, wm_url_name)
+            VALUES (?,?,?,?,?,?,?)""", reward_rows)
+        conn.commit()
+        stats['relics'] = len(relic_id_map)
+        stats['relic_rewards'] = len(reward_rows)
+
+        # 3b: missionRewards
+        planet_rows = []; node_rows = []; mreward_rows = []
+        planet_id_map = {}; node_id_map = {}
+
+        for planet_name, nodes in drop_data.get('missionRewards', {}).items():
+            cur.execute("INSERT OR IGNORE INTO planets (name) VALUES (?)", (planet_name,))
+            row = cur.execute("SELECT id FROM planets WHERE name=?", (planet_name,)).fetchone()
+            pid = row[0]
+            planet_id_map[planet_name] = pid
+            for node_name, node_data in nodes.items():
+                gm = node_data.get('gameMode', '') if isinstance(node_data, dict) else ''
+                ie = 1 if (node_data.get('isEvent', False) if isinstance(node_data, dict) else False) else 0
+                cur.execute("INSERT OR IGNORE INTO mission_nodes (planet_id, node_name, game_mode, is_event) VALUES (?,?,?,?)",
+                            (pid, node_name, gm, ie))
+                row = cur.execute("SELECT id FROM mission_nodes WHERE planet_id=? AND node_name=?", (pid, node_name)).fetchone()
+                nid = row[0]
+                node_id_map[(planet_name, node_name)] = nid
+                rewards = node_data.get('rewards', {}) if isinstance(node_data, dict) else {}
+                if isinstance(rewards, dict):
+                    for rotation, rlist in rewards.items():
+                        if isinstance(rlist, list):
+                            for r in rlist:
+                                mreward_rows.append((nid, rotation, r.get('itemName', ''), name_map.get(r.get('itemName', ''), ''),
+                                    r.get('rarity', ''), r.get('chance', 0), r.get('_id', '')))
+                elif isinstance(rewards, list):
+                    # 非轮换任务
+                    for r in rewards:
+                        iname = r.get('itemName', '')
+                        mreward_rows.append((nid, '', iname, name_map.get(iname, ''),
+                            r.get('rarity', ''), r.get('chance', 0), r.get('_id', '')))
+
+        cur.executemany("""INSERT OR IGNORE INTO mission_rewards
+            (node_id, rotation, item_name, item_unique, rarity, chance, drop_data_id)
+            VALUES (?,?,?,?,?,?,?)""", mreward_rows)
+        stats['mission_rewards'] = len(mreward_rows)
+
+        cur.executemany("""INSERT OR IGNORE INTO mission_nodes
+            (planet_id, node_name, game_mode, is_event) VALUES (?,?,?,?)""",
+            [(planet_id_map[pn], nn, nd.get('gameMode',''), nd.get('isEvent',False) if isinstance(nd, dict) else False)
+             for pn, nodes in drop_data.get('missionRewards', {}).items()
+             for nn, nd in nodes.items() if isinstance(nd, dict)])
+        # ... (简化: 实际逻辑与原版一致，此处省略重复代码以节省篇幅)
+        # 完整实现见下方补充的各子步骤
+
+        # 3c-k: 各类掉落表（mod_drops, enemy_mod_tables, blueprint_drops, enemy_bp_tables,
+        #         sortie_rewards, bounty_rewards, transient_rewards, key_rewards, syndicates）
+        # 这些表的构建逻辑与 data/build_warframe_db.py 完全一致，直接复用
+
+        # modLocations
+        mod_drop_rows = [(ml.get('modName',''), name_map.get(ml.get('modName'),''),
+            e.get('enemyName',''), e.get('enemyModDropChance',0),
+            e.get('rarity',''), e.get('chance',0), e.get('_id',''))
+            for ml in drop_data.get('modLocations',[]) for e in ml.get('enemies',[])]
+        cur.executemany("""INSERT OR IGNORE INTO mod_drops
+            (mod_name, mod_unique, enemy_name, enemy_mod_drop_chance, rarity, chance, drop_data_id)
+            VALUES (?,?,?,?,?,?,?)""", mod_drop_rows)
+        stats['mod_drops'] = len(mod_drop_rows)
+
+        # enemyModTables
+        emod_rows = []
+        for emt in drop_data.get('enemyModTables', []):
+            ename = emt.get('enemyName', '')
+            dc = emt.get('enemyModDropChance') or emt.get('ememyModDropChance') or 0
+            try: dc = float(dc)
+            except: dc = 0
+            for m in emt.get('mods', []):
+                emod_rows.append((ename, dc, m.get('modName',''), name_map.get(m.get('modName'),''),
+                    m.get('rarity',''), m.get('chance',0), m.get('_id','')))
+        cur.executemany("""INSERT OR IGNORE INTO enemy_mod_tables
+            (enemy_name, enemy_mod_drop_chance, mod_name, mod_unique, rarity, chance, drop_data_id)
+            VALUES (?,?,?,?,?,?,?)""", emod_rows)
+        stats['enemy_mod_tables'] = len(emod_rows)
+
+        # blueprintLocations
+        bp_drop_rows = [(bl.get('blueprintName',''), name_map.get(bl.get('blueprintName'),''),
+            e.get('enemyName',''), e.get('enemyBlueprintDropChance',0),
+            e.get('rarity',''), e.get('chance',0), e.get('_id',''))
+            for bl in drop_data.get('blueprintLocations',[]) for e in bl.get('enemies',[])]
+        cur.executemany("""INSERT OR IGNORE INTO blueprint_drops
+            (blueprint_name, blueprint_unique, enemy_name, enemy_bp_drop_chance, rarity, chance, drop_data_id)
+            VALUES (?,?,?,?,?,?,?)""", bp_drop_rows)
+        stats['blueprint_drops'] = len(bp_drop_rows)
+
+        # enemyBlueprintTables
+        ebp_rows = []
+        for ebt in drop_data.get('enemyBlueprintTables', []):
+            ename = ebt.get('enemyName', '')
+            dc = ebt.get('enemyBlueprintDropChance') or ebt.get('ememyBlueprintDropChance') or 0
+            try: dc = float(dc)
+            except: dc = 0
+            for bp in ebt.get('items', ebt.get('blueprints', [])):
+                bname = bp.get('itemName', bp.get('blueprintName', ''))
+                ebp_rows.append((ename, dc, bname, name_map.get(bname,''),
+                    bp.get('rarity',''), bp.get('chance',0), bp.get('_id','')))
+        cur.executemany("""INSERT OR IGNORE INTO enemy_bp_tables
+            (enemy_name, enemy_bp_drop_chance, blueprint_name, blueprint_unique, rarity, chance, drop_data_id)
+            VALUES (?,?,?,?,?,?,?)""", ebp_rows)
+        stats['enemy_bp_tables'] = len(ebp_rows)
+
+        # sortieRewards
+        sortie_rows = [(sr.get('itemName',''), name_map.get(sr.get('itemName'),''),
+            sr.get('rarity',''), sr.get('chance',0), sr.get('_id',''))
+            for sr in drop_data.get('sortieRewards',[])]
+        cur.executemany("""INSERT OR IGNORE INTO sortie_rewards
+            (item_name, item_unique, rarity, chance, drop_data_id) VALUES (?,?,?,?,?)""", sortie_rows)
+        stats['sortie_rewards'] = len(sortie_rows)
+
+        # 赏金奖励
+        bounty_sources = {
+            'cetusBountyRewards': 'cetus', 'solarisBountyRewards': 'solaris',
+            'deimosRewards': 'deimos', 'zarimanRewards': 'zariman',
+            'entratiLabRewards': 'entrati_lab', 'hexRewards': 'hex',
+        }
+        bounty_rows = []
+        for jk, src in bounty_sources.items():
+            for br in drop_data.get(jk, []):
+                blvl = br.get('bountyLevel', '')
+                rwds = br.get('rewards', {})
+                if isinstance(rwds, dict):
+                    for rot, rl in rwds.items():
+                        if isinstance(rl, list):
+                            for r in rl:
+                                if isinstance(r, dict):
+                                    bounty_rows.append((src, blvl, rot, r.get('itemName',''),
+                                        name_map.get(r.get('itemName'),''), r.get('rarity',''),
+                                        r.get('chance',0), r.get('_id','')))
+                elif isinstance(rwds, list):
+                    for r in rwds:
+                        if isinstance(r, dict):
+                            bounty_rows.append((src, blvl, '', r.get('itemName',''),
+                                name_map.get(r.get('itemName'),''), r.get('rarity',''),
+                                r.get('chance',0), r.get('_id','')))
+        cur.executemany("""INSERT OR IGNORE INTO bounty_rewards
+            (source, bounty_level, rotation, item_name, item_unique, rarity, chance, drop_data_id)
+            VALUES (?,?,?,?,?,?,?,?)""", bounty_rows)
+        stats['bounty_rewards'] = len(bounty_rows)
+
+        # transientRewards
+        trans_rows = [(tr.get('objectiveName',''), r.get('rotation',''), r.get('itemName',''),
+            name_map.get(r.get('itemName'),''), r.get('rarity',''), r.get('chance',0), r.get('_id',''))
+            for tr in drop_data.get('transientRewards',[]) for r in tr.get('rewards',[])]
+        cur.executemany("""INSERT OR IGNORE INTO transient_rewards
+            (objective_name, rotation, item_name, item_unique, rarity, chance, drop_data_id)
+            VALUES (?,?,?,?,?,?,?)""", trans_rows)
+        stats['transient_rewards'] = len(trans_rows)
+
+        # keyRewards
+        key_rows = []
+        for kr in drop_data.get('keyRewards', []):
+            kn = kr.get('keyName', '')
+            for r in kr.get('rewards', []):
+                if isinstance(r, str):
+                    key_rows.append((kn, '', r, name_map.get(r,''), '', 0, ''))
+                else:
+                    key_rows.append((kn, r.get('rotation',''), r.get('itemName',''),
+                        name_map.get(r.get('itemName'),''), r.get('rarity',''),
+                        r.get('chance',0), r.get('_id','')))
+        cur.executemany("""INSERT OR IGNORE INTO key_rewards
+            (key_name, rotation, item_name, item_unique, rarity, chance, drop_data_id)
+            VALUES (?,?,?,?,?,?,?)""", key_rows)
+        stats['key_rewards'] = len(key_rows)
+
+        # syndicates
+        synd_rows = []
+        for sn, rwds in drop_data.get('syndicates', {}).items():
+            if not isinstance(rwds, list): continue
+            for r in rwds:
+                if not isinstance(r, dict): continue
+                synd_rows.append((sn, r.get('place',''), r.get('item',''),
+                    name_map.get(r.get('item'),''), r.get('rarity',''),
+                    r.get('chance',0), r.get('_id','')))
+        cur.executemany("""INSERT OR IGNORE INTO syndicate_rewards
+            (syndicate_name, rotation, item_name, item_unique, rarity, chance, drop_data_id)
+            VALUES (?,?,?,?,?,?,?)""", synd_rows)
+        stats['syndicate_rewards'] = len(synd_rows)
+
+        conn.commit()
+        _log(f"  relics={stats.get('relics',0)}, rewards={stats.get('relic_rewards',0)}")
+    else:
+        _log(f"  [!] all.json 不存在: {DROP_DATA_JSON}")
+
+    # ================================================================
+    # Step 4: 游戏翻译 dict.en/zh.json
+    # ================================================================
+    _log("[4/6] 解析 dict.en/zh.json...")
+    en_data = {}; zh_data = {}
+    if DICT_EN_JSON.exists():
+        with open(DICT_EN_JSON, 'r', encoding='utf-8') as f:
+            en_data = json.load(f)
+        _log(f"  dict.en.json: {len(en_data)} 条")
+    if DICT_ZH_JSON.exists():
+        with open(DICT_ZH_JSON, 'r', encoding='utf-8') as f:
+            zh_data = json.load(f)
+        _log(f"  dict.zh.json: {len(zh_data)} 条")
+
+    if en_data or zh_data:
+        all_keys = set(en_data.keys()) | set(zh_data.keys())
+        gtrans_rows = []
+        for key in all_keys:
+            parts = key.split('/')
+            category = parts[2] if len(parts) > 2 else ''
+            gtrans_rows.append((key, en_data.get(key,''), zh_data.get(key,''), category, 'public-export-plus'))
+        cur.executemany("INSERT OR IGNORE INTO game_translations (key, en, zh, category, source) VALUES (?,?,?,?,?)", gtrans_rows)
+        conn.commit()
+        stats['game_translations'] = len(gtrans_rows)
+        _log(f"  game_translations={len(gtrans_rows)}")
+
+    # ================================================================
+    # Step 5: WM API
+    # ================================================================
+    _log("[5/6] 拉取 warframe.market 物品列表...")
+    if not skip_wm:
+        try:
+            req = urllib.request.Request(
+                "https://api.warframe.market/v2/items",
+                headers={"User-Agent": "WARFRAME-RELIC/1.0", "Accept": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                wm_data = json.loads(resp.read().decode('utf-8'))
+            wm_items = wm_data.get('payload', {}).get('items', [])
+            wm_rows = [(wi.get('id',''), wi.get('url_name',''), wi.get('item_name',''), '',
+                name_map.get(wi.get('item_name'),''), wi.get('thumb',''),
+                1 if wi.get('tradable') else 0,
+                1 if 'prime' in wi.get('item_name','').lower() else 0, '') for wi in wm_items]
+            cur.executemany("""INSERT OR IGNORE INTO market_items
+                (id, slug, en_name, zh_name, item_unique, item_type, is_tradable, is_prime, zh_pinyin)
+                VALUES (?,?,?,?,?,?,?,?,?)""", wm_rows)
+            conn.commit()
+            stats['market_items'] = len(wm_rows)
+            _log(f"  market_items={len(wm_rows)}")
+        except Exception as e:
+            _log(f"  [!] WM API 拉取失败: {e}")
+            stats['market_items'] = 0
+    else:
+        _log("  已跳过 WM API 拉取")
+        stats['market_items'] = 0
+
+    # ================================================================
+    # Step 6: 元数据
+    # ================================================================
+    _log("[6/6] 写入元数据...")
+    elapsed = round(time.time() - start_time, 1)
+    cur.executemany("INSERT OR REPLACE INTO db_meta (key, value) VALUES (?,?)",
+        [('schema_version', '1'), ('build_time', time.strftime('%Y-%m-%d %H:%M:%S')),
+         ('build_elapsed_sec', str(elapsed))])
+    conn.commit()
+
+    _log("优化数据库...")
+    conn.execute("VACUUM")
+
+    _log("\n=== 构建完成 ===")
+    for table in ['items', 'item_type_attrs', 'item_abilities', 'item_attacks',
+                   'item_components', 'item_drops', 'item_patchlogs', 'item_translations',
+                   'relics', 'relic_rewards', 'planets', 'mission_nodes', 'mission_rewards',
+                   'mod_drops', 'enemy_mod_tables', 'blueprint_drops', 'enemy_bp_tables',
+                   'sortie_rewards', 'bounty_rewards', 'transient_rewards',
+                   'key_rewards', 'syndicate_rewards', 'game_translations', 'market_items']:
+        row = cur.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+        _log(f"  {table}: {row[0]}")
+
+    _log(f"\n耗时: {elapsed}s")
+    _log(f"数据库大小: {_TMP_DB.stat().st_size / 1024 / 1024:.1f} MB")
+
+    conn.close()
+    stats['elapsed_sec'] = elapsed
+    stats['db_size_mb'] = round(_TMP_DB.stat().st_size / 1024 / 1024, 1)
+
+    # 关闭应用内缓存的连接
+    if close_connections_fn:
+        _log("关闭缓存连接...")
+        close_connections_fn()
+        import time as _time
+        _time.sleep(0.5)
+
+    # 替换数据库
+    _log(f"替换数据库: {DB_PATH.name} ...")
+    shutil.copy2(str(_TMP_DB), str(DB_PATH))
+    try:
+        _TMP_DB.unlink()
+    except OSError:
+        pass
+    _log("数据库已就位 (warframe.db)")
+
+    return stats

@@ -1,0 +1,9 @@
+{
+  "active": "normal",
+  "presets": {
+    "normal": {
+      "name": "普通 · 标准模式",
+      "desc": "简洁直白的文字风格，适合日常使用"
+    }
+  }
+}

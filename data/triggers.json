@@ -1,0 +1,17 @@
+[
+  {
+    "name": "GAUSS",
+    "enabled": false,
+    "trigger_input": {
+      "type": "mouse",
+      "button": "left_press"
+    },
+    "delay_ms": 10,
+    "actions": [
+      {
+        "type": "key",
+        "value": "3"
+      }
+    ]
+  }
+]

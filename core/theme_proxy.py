@@ -1,0 +1,145 @@
+"""
+WARFRAME-RELIC 主题颜色代理
+- _ThemeProxy: 属性代理类，自动跟随 theme 单例变化
+- 模块级颜色常量（如 CYBER_YELLOW, BTN_DEFAULT_BG 等）
+
+使用方式：
+    from core.theme_proxy import CYBER_YELLOW
+    print(CYBER_YELLOW)  # 每次访问都从 theme 实时取值
+"""
+from core.theme_config import theme
+
+
+class _ThemeProxy:
+    """模块级变量代理 —— 访问时自动从 theme 单例读取最新值。
+
+    使用方式：
+        from core.theme_proxy import CYBER_YELLOW
+        print(CYBER_YELLOW)  # 每次访问都从 theme.cyber_yellow 取值
+
+    替换了旧的「一次性赋值 + _sync_module_globals()」模式。
+    """
+    __slots__ = ('_attr',)
+
+    def __init__(self, attr: str):
+        object.__setattr__(self, '_attr', attr)
+
+    # ---- 值解析 ----
+    def _value(self):
+        return getattr(theme, self._attr)
+
+    # ---- 属性委托：所有属性访问（含 str 方法）转发到实际值 ----
+    def __getattribute__(self, name):
+        if name in ('_attr', '_value', '__class__', '__dict__'):
+            return object.__getattribute__(self, name)
+        return getattr(object.__getattribute__(self, '_value')(), name)
+
+    # ---- 双下划线魔术方法 ----
+    def __repr__(self):
+        return repr(self._value())
+
+    def __str__(self):
+        return str(self._value())
+
+    def __eq__(self, other):
+        return self._value() == other
+
+    def __hash__(self):
+        return hash(self._value())
+
+    def __bool__(self):
+        return bool(self._value())
+
+    def __getitem__(self, index):
+        return self._value()[index]
+
+    def __len__(self):
+        return len(self._value())
+
+    def __contains__(self, item):
+        return item in self._value()
+
+    def __iter__(self):
+        return iter(self._value())
+
+
+def _proxy(attr: str):
+    """创建 _ThemeProxy 实例。"""
+    return _ThemeProxy(attr)
+
+
+# ============================================================
+# 模块级别名（自动代理，无需手动同步）
+# ============================================================
+
+CYBER_YELLOW  = _proxy('cyber_yellow')
+CYBER_CYAN    = _proxy('cyber_cyan')
+CYBER_MAGENTA = _proxy('cyber_magenta')
+CYBER_ORANGE  = _proxy('cyber_orange')
+CYBER_RED     = _proxy('cyber_red')
+CYBER_GREEN   = _proxy('cyber_green')
+CYBER_PANEL_BG = _proxy('panel_bg')
+CYBER_CARD_BG  = _proxy('card_bg')
+CYBER_BORDER   = _proxy('border')
+CYBER_TEXT     = _proxy('text')
+CYBER_TEXT_DIM = _proxy('text_dim')
+
+# 遗物状态：入库=红色，出库=绿色
+COLOR_VAULTED   = _proxy('cyber_red')
+COLOR_AVAILABLE = _proxy('cyber_green')
+COLOR_UNKNOWN   = _proxy('color_unknown')
+FALLBACK_COLOR  = _proxy('color_unknown')
+
+COLOR_GOLD   = _proxy('color_gold')
+COLOR_SILVER = _proxy('color_silver')
+COLOR_COPPER = _proxy('color_copper')
+
+LOG_COLOR_MAP = _proxy('log_color_map')
+
+OVERLAY_BG_COLOR = _proxy('overlay_bg_rgba')
+OVERLAY_SELECTION_OVERLAY = _proxy('overlay_selection_overlay_rgba')
+
+BTN_DEFAULT_BG = _proxy('btn_default_bg')
+BTN_DEFAULT_TEXT = _proxy('btn_default_text')
+BTN_DEFAULT_BORDER = _proxy('btn_default_border')
+BTN_HOVER_BG = _proxy('btn_hover_bg')
+BTN_HOVER_TEXT = _proxy('btn_hover_text')
+BTN_HOVER_BORDER = _proxy('btn_hover_border')
+BTN_PRESSED_BG = _proxy('btn_pressed_bg')
+BTN_DISABLED_BG = _proxy('btn_disabled_bg')
+BTN_DISABLED_TEXT = _proxy('btn_disabled_text')
+BTN_DISABLED_BORDER = _proxy('btn_disabled_border')
+
+BRAND_BILIBILI = _proxy('brand_bilibili')
+BRAND_BILIBILI_HOVER = _proxy('brand_bilibili_hover')
+BRAND_GITHUB = _proxy('brand_github')
+BRAND_GITHUB_HOVER = _proxy('brand_github_hover')
+
+LABEL_DEFAULT = _proxy('label_default')
+PANEL_BG = _proxy('panel_bg')
+CARD_BG = _proxy('card_bg')
+PROGRESS_GRADIENT_START = _proxy('progress_gradient_start')
+PROGRESS_GRADIENT_MID = _proxy('progress_gradient_mid')
+PROGRESS_GRADIENT_END = _proxy('progress_gradient_end')
+LOG_TIMESTAMP = _proxy('text_dim')
+FETCH_MANUAL_HINT = _proxy('fetch_manual_hint')
+FETCH_ERROR_COLOR = _proxy('fetch_error_color')
+
+# ---- 辅助色 ----
+SUBTLE_BORDER = _proxy('subtle_border')
+MUTED_TEXT = _proxy('muted_text')
+LIGHT_TEXT = _proxy('light_text')
+COLOR_BLACK = _proxy('color_black')
+COLOR_DARK_GRAY = _proxy('color_dark_gray')
+COLOR_ENEMY = _proxy('color_enemy')
+COLOR_PURPLE = _proxy('color_purple')
+LINK_COLOR = _proxy('link_color')
+
+# ---- 在线状态 ----
+STATUS_ONLINE = _proxy('status_online')
+STATUS_INGAME = _proxy('status_ingame')
+STATUS_OFFLINE = _proxy('status_offline')
+STATUS_AWAY = _proxy('status_away')
+
+# ---- JSON 查看器 ----
+JSON_BOOLEAN = _proxy('json_boolean')
