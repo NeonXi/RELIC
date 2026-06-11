@@ -102,7 +102,7 @@ class _TriggerStatusBar(QFrame):
         else:
             bg = QColor(0, 0, 0, 0)
             border = TokenManager.instance().get_qcolor("border.subtle")
-            text_color = TokenManager.instance().get_qcolor("text.dim")
+            text_color = TokenManager.instance().get_qcolor("text.tertiary")
 
         painter.fillPath(path, QBrush(bg))
         painter.setPen(
