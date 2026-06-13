@@ -50,6 +50,7 @@ NAV_ITEMS = [
     ("db_overview", "数据总览"),
     ("items",       "物品查询"),
     ("triggers",    "辅助触发器"),
+    ("eye_mask",    "护眼遮罩"),
     ("prices",      "价格数据"),
     ("theme",       "主题换肤"),
     ("preset",      "语言预设"),
@@ -62,6 +63,7 @@ _PAGE_CLASS_MAP = {
     "db_overview": "core.pages.status_page:StatusPage",
     "items":       "core.pages.items_page:ItemsPage",
     "triggers":    "core.pages.triggers_page:TriggersPage",
+    "eye_mask":    "core.pages.eye_mask_page:EyeMaskPage",
     "prices":      "core.pages.prices_page:PricesPage",
     "theme":       "core.pages.theme_page:ThemePage",
     "preset":      "core.pages.preset_page:PresetPage",
@@ -203,19 +205,23 @@ class AppShell(QMainWindow):
     # ══════════════════════════════════
 
     def _show_splash_and_build(self) -> None:
-        """先显示主窗口 + 构建完整 UI，再用透明 overlay 跑启动动画。"""
+        """先构建完整 UI，再显示窗口，最后覆盖启动动画。
+
+        关键顺序：先构建 UI → 再 show() → 立即覆盖 splash。
+        避免先 show() 再 build 导致的"空白小窗口闪烁"问题。
+        """
         from core.widgets.splash_screen import CyberSplashScreen
 
-        # 1. 显示主窗口
-        self.show()
-
-        # 2. 构建完整 UI
+        # 1. 构建完整 UI（窗口尚未显示，不会出现空白窗口）
         print("[Splash] 开始构建 UI...", flush=True)
         self._build_ui()
-        self._register_pages()
         self._start_pipeline()
+        self._register_pages()
         self._switch_to(NAV_ITEMS[0][0])
         print(f"[Splash] UI 构建完成, 页面数={len(self._pages)}", flush=True)
+
+        # 2. 显示主窗口（此时 UI 已完整构建，窗口尺寸正确）
+        self.show()
 
         # 3. 覆盖启动动画（父控件 = AppShell 自身，fill 整个窗口）
         self._splash = CyberSplashScreen(
@@ -494,3 +500,8 @@ class AppShell(QMainWindow):
     def pipeline(self):
         """获取截图OCR管线服务实例。"""
         return self._pipeline_svc
+
+    @property
+    def trigger_manager(self):
+        """获取辅助触发器引擎实例。"""
+        return self._trigger_manager

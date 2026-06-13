@@ -6,6 +6,8 @@
 复用 core.proxy_config 纯逻辑层。
 """
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
@@ -24,41 +26,71 @@ from core.proxy_config import (
 
 
 class _ProxyTestWorker(QObject):
-    """后台线程：测试所有代理镜像对所有仓库的连通性。"""
+    """后台线程：并行测试所有代理镜像对所有仓库的连通性。"""
 
     progress = QtSignal(int, str)       # (pct, 描述)
     log = QtSignal(str, str)            # (level, msg)
     finished = QtSignal(dict)           # 汇总结果
     error = QtSignal(str)               # 错误信息
 
-    def __init__(self, mirrors: list, timeout: int = 10):
-        QThread.__init__(self)
+    def __init__(self, mirrors: list, timeout: int = 10, max_workers: int = 6):
+        super().__init__()
         self._mirrors = mirrors
         self._timeout = timeout
+        self._max_workers = max_workers
         self._cancelled = False
+        self._executor: Optional[ThreadPoolExecutor] = None
 
     def cancel(self):
+        """取消测试。"""
         self._cancelled = True
+        if self._executor:
+            self._executor.shutdown(wait=False, cancel_futures=True)
 
     def run(self):
         repos = get_repo_defs()
-        total_tests = len(repos) * len(self._mirrors)
-        completed = 0
-        results = {}
+        # 构建任务列表: [(repo_name, mirror_idx, mirror_url), ...]
+        tasks = []
+        for repo_name in repos:
+            for idx, mirror in enumerate(self._mirrors):
+                tasks.append((repo_name, idx, mirror))
+
+        total = len(tasks)
+        if total == 0:
+            self.finished.emit({})
+            return
 
         clear_test_results()
+        results = {repo_name: {"working": [], "failed": []} for repo_name in repos}
+        completed = 0
 
-        for repo_name in repos:
-            results[repo_name] = {"working": [], "failed": []}
-            for idx, mirror in enumerate(self._mirrors):
+        # 并行执行，最多 max_workers 个并发
+        self._executor = ThreadPoolExecutor(max_workers=min(self._max_workers, total))
+        future_to_task = {}
+
+        for repo_name, idx, mirror in tasks:
+            if self._cancelled:
+                return
+            fut = self._executor.submit(test_repo_mirror, repo_name, mirror, timeout=self._timeout)
+            future_to_task[fut] = (repo_name, idx, mirror)
+
+        # 按完成顺序收集结果
+        try:
+            for future in as_completed(future_to_task):
                 if self._cancelled:
                     return
+
+                repo_name, idx, mirror = future_to_task[future]
                 completed += 1
-                pct = int(completed / total_tests * 100)
+                pct = int(completed / total * 100)
                 self.progress.emit(pct, f"测试 {repo_name} [{idx + 1}/{len(self._mirrors)}]")
                 self.log.emit("info", f"  测试: {repo_name} \u2190 镜像 [{idx}]")
 
-                success = test_repo_mirror(repo_name, mirror, timeout=self._timeout)
+                try:
+                    success = future.result()
+                except Exception:
+                    success = False
+
                 update_test_result(repo_name, idx, success)
 
                 if success:
@@ -67,6 +99,10 @@ class _ProxyTestWorker(QObject):
                 else:
                     results[repo_name]["failed"].append(idx)
                     self.log.emit("warn", f"    [X] 镜像 [{idx}] 不可用")
+
+        finally:
+            self._executor.shutdown(wait=False)
+            self._executor = None
 
         self.progress.emit(100, "测试完成")
         self.finished.emit(results)
@@ -77,9 +113,14 @@ class CyberProxyDialog(QDialog, CyberWidgetMixin):
 
     # ── token 颜色辅助（带默认值回退）──
 
-    def _tc(self, key: str) -> QColor:
-        """获取 token 颜色。"""
-        return self.token_color(key)
+    def _tc(self, key: str, default=None) -> QColor:
+        """获取 token 颜色，支持默认值回退。"""
+        try:
+            return self.token_color(key)
+        except Exception:
+            if default is not None:
+                return QColor(default) if not isinstance(default, QColor) else default
+            raise
 
     def __init__(self, parent=None):
         QDialog.__init__(self, parent)

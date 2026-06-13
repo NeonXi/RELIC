@@ -95,6 +95,7 @@ def _ensure_deps():
         ("cv2", "opencv-python"),
         ("dxcam", "dxcam"),
         ("rapidocr_onnxruntime", "rapidocr_onnxruntime"),
+        ("pypinyin", "pypinyin"),
     ]
     for import_name, pip_name in deps:
         try:
@@ -102,7 +103,8 @@ def _ensure_deps():
         except ImportError:
             _log(f"installing {pip_name} ...")
             subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", pip_name, "-q"])
+                [sys.executable, "-m", "pip", "install", pip_name,
+                 "--no-warn-script-location"])
             _log(f"{pip_name} installed.")
 
 
@@ -319,6 +321,7 @@ def run_watch():
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--trae")]
+    frozen = getattr(sys, "frozen", False)
 
     if "--child" in args:
         # Child process: run the Qt app
@@ -327,12 +330,17 @@ def main():
 
     if "--once" in args:
         # One-shot launch
-        _ensure_admin()
-        _ensure_deps()
+        if not frozen:
+            _ensure_admin()
+            _ensure_deps()
         run_child()
         return
 
     # Default: watch mode
+    if frozen:
+        # 打包后直接运行
+        run_child()
+        return
     _ensure_admin()
     _ensure_deps()
     try:

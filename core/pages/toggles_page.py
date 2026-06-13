@@ -1,24 +1,27 @@
 """
 [L-Page] TogglesPage — 功能开关 + 快捷键配置页面。
 
-依赖: PySide6 + data/feature_toggles.json + data/hotkeys.json
-用途: 管理应用功能模块的开启/关闭状态 + 全局快捷键绑定。
+依赖: PySide6 + data/feature_toggles.json + data/hotkeys.json + data/triggers.json
+用途: 管理应用功能模块的开启/关闭状态 + 全局快捷键绑定 + 辅助触发器开关。
 
 功能:
   - 功能开关（核心功能 / 界面行为）
+  - 辅助触发器启用/禁用（同步自 triggers.json）
   - 快捷键绑定（框选截图 / 全屏截图）
   - 保存修改到 JSON 文件
   - 支持恢复默认值
 
 数据源:
   - data/feature_toggles.json （功能开关）
-  - data/hotkeys.json （快捷键）
+  - data/triggers.json       （辅助触发器）
+  - data/hotkeys.json        （快捷键）
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox,
@@ -31,7 +34,12 @@ from core.pages.base_page import PageBase
 from core.widgets.panel import CyberPanel
 from core.widgets.button import CyberButton
 from core.widgets.card import CyberCard
+from core.widgets.toggle_switch import CyberToggleSwitch
 from core.tokens.manager import TokenManager
+from core.trigger_config import (
+    load_triggers, save_triggers,
+    format_trigger_summary,
+)
 
 
 # ── 功能开关定义 ──
@@ -55,6 +63,7 @@ _DEFAULT_VALUES = {k: v for k, v, _ in _TOGGLE_DEFS}
 _HOTKEY_DEFS = [
     ("select",     "hotkey.label_select",     "ctrl+g"),
     ("fullscreen", "hotkey.label_fullscreen", "ctrl+h"),
+    ("eye_mask",   "hotkey.label_eye_mask",   "ctrl+j"),
 ]
 
 
@@ -237,12 +246,20 @@ class TogglesPage(PageBase):
         self._hotkeys_data: dict[str, str] = {}
         self._hotkey_edits: dict[str, _HotkeyCaptureEdit] = {}
 
+        # 辅助触发器数据
+        self._triggers_data: list[dict] = []
+        self._trigger_checkboxes: list[tuple[CyberToggleSwitch, int]] = []  # (toggle_switch, index_in_list)
+        self._triggers_layout: Optional[QVBoxLayout] = None  # 触发器卡片的内容布局引用
+
+        # ★ 必须在 PageBase.__init__ 之前加载数据，
+        #   因为 PageBase 内部会调用 build_content() 构建UI
+        self._load_toggles()
+        self._load_hotkeys()
+        self._load_triggers()
+
         PageBase.__init__(self)
 
         self.page_title = self._copy("nav.toggles", "功能开关")
-
-        self._load_toggles()
-        self._load_hotkeys()
 
     # ════════════════════════════════════
     #  数据加载/保存
@@ -311,6 +328,70 @@ class TogglesPage(PageBase):
             print(f"[TogglesPage] 保存热键失败: {e}", flush=True)
             return False
 
+    def _load_triggers(self) -> None:
+        """从 triggers.json 加载辅助触发器列表。"""
+        try:
+            self._triggers_data = load_triggers()
+        except Exception as e:
+            print(f"[TogglesPage] 加载触发器失败: {e}", flush=True)
+            self._triggers_data = []
+
+    def _save_triggers(self) -> bool:
+        """将触发器启用/禁用状态保存回 triggers.json。
+
+        只更新 enabled 字段，不修改其他配置。
+        """
+        try:
+            print(f"[TogglesPage] _save_triggers: 开关数={len(self._trigger_checkboxes)}", flush=True)
+            for sw, idx in self._trigger_checkboxes:
+                if idx < len(self._triggers_data):
+                    self._triggers_data[idx]["enabled"] = sw.isChecked()
+                    print(f"  [{idx}] {self._triggers_data[idx].get('name')}: enabled={sw.isChecked()}", flush=True)
+            ok = save_triggers(self._triggers_data)
+            print(f"[TogglesPage] _save_triggers: 保存{'成功' if ok else '失败'}", flush=True)
+            return ok
+        except Exception as e:
+            print(f"[TogglesPage] 保存触发器失败: {e}", flush=True)
+            return False
+
+    # ════════════════════════════════════
+    #  即时保存 + 通知引擎
+    # ════════════════════════════════════
+
+    def _apply_toggles(self) -> None:
+        """保存功能开关并通知管线服务。"""
+        if not self._save_toggles():
+            return
+        try:
+            shell = self._get_shell()
+            if shell and shell.pipeline:
+                shell.pipeline.update_feature_toggles(self._toggles_data)
+        except Exception:
+            pass
+
+    def _apply_hotkeys(self) -> None:
+        """保存快捷键并通知管线重注册。"""
+        if not self._save_hotkeys():
+            return
+        try:
+            shell = self._get_shell()
+            if shell and shell.pipeline:
+                shell.pipeline.reregister_hotkeys()
+        except Exception:
+            pass
+
+    def _apply_triggers(self) -> None:
+        """保存触发器状态并通知引擎热重载。"""
+        if not self._save_triggers():
+            return
+        try:
+            shell = self._get_shell()
+            if shell and hasattr(shell, 'trigger_manager') and shell.trigger_manager:
+                shell.trigger_manager.reload()
+                print("[TogglesPage] 触发器引擎已重载", flush=True)
+        except Exception:
+            pass
+
     # ════════════════════════════════════
     #  UI 构建
     # ════════════════════════════════════
@@ -352,13 +433,6 @@ class TogglesPage(PageBase):
         btn_reset.clicked.connect(self._on_reset_defaults)
         btn_row.addWidget(btn_reset)
 
-        btn_save = CyberButton(
-            text=self._copy("toggles.btn_save", "保存设置"), variant="solid"
-        )
-        btn_save.setFixedWidth(90)
-        btn_save.clicked.connect(self._on_save)
-        btn_row.addWidget(btn_save)
-
         layout.addLayout(btn_row)
 
         # ════════════════════
@@ -392,7 +466,12 @@ class TogglesPage(PageBase):
             layout.addWidget(card)
 
         # ════════════════════
-        #  第二区：快捷键绑定
+        #  第二区：辅助触发器开关
+        # ════════════════════
+        self._build_triggers_card(layout)
+
+        # ════════════════════
+        #  第三区：快捷键绑定
         # ════════════════════
         hk_card = CyberCard(title=self._copy("hotkeys.card_binding", "快捷键绑定"))
         hk_layout = hk_card.content_layout()
@@ -479,24 +558,27 @@ class TogglesPage(PageBase):
                 border-color: {self._color('accent.secondary')};
             }}
         """)
-        cb.stateChanged.connect(lambda state, k=key, dot=self._make_status_dot(): (
-            dot.setText("●" if state == Qt.CheckState.Checked.value else "○"),
-            dot.setStyleSheet(
-                f"color: {self._color('brand.green') if state == Qt.CheckState.Checked.value else self._color('neutral.dark')}; "
-                f"font-size: {self._font_size('micro', 10)}px;"
-            ),
-        )[-1])
 
-        self._checkboxes[key] = cb
-        row.addWidget(cb)
-        row.addStretch()
-
+        # ── 状态点（先创建，再在信号中引用）──
         status_dot = QLabel("●" if current_val else "○")
         status_dot.setStyleSheet(
             f"color: {self._color('brand.green') if current_val else self._color('neutral.dark')}; "
             f"font-size: {self._font_size('micro', 10)}px;"
         )
         status_dot.setFixedWidth(20)
+
+        cb.stateChanged.connect(lambda state, dot=status_dot, k=key: (
+            dot.setText("●" if state == Qt.CheckState.Checked.value else "○"),
+            dot.setStyleSheet(
+                f"color: {self._color('brand.green') if state == Qt.CheckState.Checked.value else self._color('neutral.dark')}; "
+                f"font-size: {self._font_size('micro', 10)}px;"
+            ),
+            self._toggles_data.__setitem__(k, state == Qt.CheckState.Checked.value),
+            self._apply_toggles(),
+        )[-1])
+
+        self._checkboxes[key] = cb
+        row.addWidget(cb, stretch=1)
         row.addWidget(status_dot)
 
         return row
@@ -532,29 +614,181 @@ class TogglesPage(PageBase):
         return row
 
     def _on_hotkey_captured(self, action_key: str, value: str):
-        """热键捕获完成回调。"""
+        """热键捕获完成回调 — 即时保存。"""
         print(f"[TogglesPage] 热键 {action_key} → {value}", flush=True)
+        self._hotkeys_data[action_key] = value
+        self._apply_hotkeys()
 
     def _reset_hotkey(self, action_key: str, default_val: str):
-        """重置单个热键为默认值。"""
+        """重置单个热键为默认值 — 即时保存。"""
         edit = self._hotkey_edits.get(action_key)
         if edit:
             edit.value = default_val
+        self._hotkeys_data[action_key] = default_val
+        self._apply_hotkeys()
 
-    def _make_status_dot(self):
-        """创建占位 QLabel。"""
-        return QLabel("○")
+    # ════════════════════════════════════
+    #  辅助触发器开关区域
+    # ════════════════════════════════════
+
+    def _build_triggers_card(self, parent_layout: QVBoxLayout) -> None:
+        """构建辅助触发器开关卡片，插入到父布局中。
+
+        只创建卡片壳体和描述文字，内容由 _populate_triggers_section 填充。
+        底部始终显示"前往详细配置"按钮。
+        """
+        group_name = self._copy("toggles.group_triggers", "辅助触发器")
+        card = CyberCard(title=group_name)
+        card_layout = card.content_layout()
+        card_layout.setContentsMargins(
+            self._spacing("md", 16),
+            self._spacing("lg_xl", 28),
+            self._spacing("md", 16),
+            self._spacing("md", 16)
+        )
+        card_layout.setSpacing(self._spacing("sm", 10))
+
+        # ★ 内层布局：存放触发器行，on_enter 时清理重建
+        self._triggers_layout = QVBoxLayout()
+        self._triggers_layout.setContentsMargins(0, 0, 0, 0)
+        self._triggers_layout.setSpacing(self._spacing("sm", 10))
+        card_layout.addLayout(self._triggers_layout)
+
+        self._populate_triggers_section()
+
+        # ── 底部：前往详细配置按钮（不在内层布局中，不会被清理）──
+        goto_btn = CyberButton(
+            text=self._copy("toggles.trigger_goto_config", "前往详细配置"),
+            variant="outlined",
+        )
+        goto_btn.setFixedWidth(120)
+        goto_btn.clicked.connect(self._goto_triggers_page)
+        card_layout.addWidget(goto_btn)
+
+        parent_layout.addWidget(card)
+
+    def _goto_triggers_page(self):
+        """导航到触发器配置页面。"""
+        if self._app_shell is not None:
+            self._app_shell._switch_to("triggers")
+
+    def _populate_triggers_section(self) -> None:
+        """★ 清除旧控件并重新加载触发器数据构建开关行。
+
+        每次 on_enter 时调用，确保 UI 与磁盘数据完全一致。
+        """
+        layout = self._triggers_layout
+        if layout is None:
+            print(f"[TogglesPage] _populate_triggers_section: layout is None, 跳过", flush=True)
+            return
+
+        print(f"[TogglesPage] _populate_triggers_section: 清除旧控件, 数据={len(self._triggers_data)}个", flush=True)
+        # 清除旧控件
+        self._clear_layout(layout)
+        self._trigger_checkboxes.clear()
+
+        if not self._triggers_data:
+            empty_lbl = QLabel(
+                self._copy("toggles.trigger_empty", "暂无触发器")
+            )
+            empty_lbl.setStyleSheet(
+                f"color: {self._color('text.tertiary')}; "
+                f"font-size: {self._font_size('sm', 12)}px;"
+            )
+            layout.addWidget(empty_lbl)
+        else:
+            for idx, trigger in enumerate(self._triggers_data):
+                row = self._build_trigger_toggle_row(trigger, idx)
+                layout.addLayout(row)
+
+    @staticmethod
+    def _clear_layout(layout: QVBoxLayout) -> None:
+        """安全清空布局中的所有子控件。"""
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            if item is None:
+                continue
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+            sub_layout = item.layout()
+            if sub_layout is not None:
+                TogglesPage._clear_layout(sub_layout)
+
+    def _build_trigger_toggle_row(self, trigger: dict, idx: int) -> QHBoxLayout:
+        """构建一行辅助触发器开关：[切角按钮] 名称 + 摘要 [状态点]。"""
+        row = QHBoxLayout()
+        row.setSpacing(10)
+
+        name = trigger.get("name", "")
+        enabled = bool(trigger.get("enabled", False))
+        summary = format_trigger_summary(trigger)
+
+        display_name = name if name else self._copy(
+            "triggers.state_unnamed", "未命名"
+        )
+        label_text = f"{display_name}  —  {summary}"
+
+        # ── 切角开关按钮 ──
+        sw = CyberToggleSwitch(text=label_text, checked=enabled)
+        sw.toggled.connect(
+            lambda checked, i=idx, s=sw: self._on_trigger_clicked(i, checked, s)
+        )
+
+        self._trigger_checkboxes.append((sw, idx))
+        row.addWidget(sw, stretch=1)
+
+        # ── 状态指示点 ──
+        status_dot = QLabel("●" if enabled else "○")
+        dot_color = self._color("brand.green") if enabled else self._color("neutral.dark")
+        status_dot.setStyleSheet(
+            f"color: {dot_color}; "
+            f"font-size: {self._font_size('micro', 10)}px;"
+        )
+        status_dot.setFixedWidth(20)
+        row.addWidget(status_dot)
+
+        # 保存 dot 引用以便回调更新
+        sw._status_dot = status_dot
+
+        return row
+
+    def _on_trigger_clicked(self, idx: int, checked: bool, sw: CyberToggleSwitch) -> None:
+        """用户点击触发器开关：更新内存 + UI + 即时保存 + 重载引擎。"""
+        print(f"[TogglesPage] _on_trigger_clicked idx={idx}, checked={checked}", flush=True)
+        # 更新内存数据
+        if idx < len(self._triggers_data):
+            self._triggers_data[idx]["enabled"] = checked
+        # 更新状态点
+        dot = getattr(sw, '_status_dot', None)
+        if dot is not None:
+            dot.setText("●" if checked else "○")
+            dot_color = self._color("brand.green") if checked else self._color("neutral.dark")
+            dot.setStyleSheet(
+                f"color: {dot_color}; "
+                f"font-size: {self._font_size('micro', 10)}px;"
+            )
+        # ★ 即时保存文件 + 通知引擎热重载
+        self._apply_triggers()
 
     # ════════════════════════════════════
     #  操作回调
     # ════════════════════════════════════
 
     def on_enter(self):
-        """页面进入时重新加载最新配置。"""
+        """页面进入时重新加载最新配置并重建 UI。"""
+        print(f"[TogglesPage] on_enter() 开始", flush=True)
         self._load_toggles()
         self._load_hotkeys()
+        self._load_triggers()
+        print(f"[TogglesPage] on_enter() 触发器数据: {len(self._triggers_data)}个", flush=True)
+        for t in self._triggers_data:
+            print(f"  {t.get('name')}: enabled={t.get('enabled')}", flush=True)
 
-        # 同步 checkbox 状态
+        # 同步功能开关 checkbox 状态
         for key, cb in self._checkboxes.items():
             val = self._toggles_data.get(key, _DEFAULT_VALUES.get(key, False))
             cb.blockSignals(True)
@@ -566,38 +800,31 @@ class TogglesPage(PageBase):
             val = self._hotkeys_data.get(key, "")
             edit.value = val
 
-    def _on_save(self):
-        """保存按钮点击。"""
-        toggle_ok = self._save_toggles()
-        hotkey_ok = self._save_hotkeys()
-
-        if toggle_ok and hotkey_ok:
-            print("[TogglesPage] 设置已保存", flush=True)
-            # 通知管线服务更新功能开关 + 热键
-            try:
-                shell = self._get_shell()
-                if shell and shell.pipeline:
-                    shell.pipeline.update_feature_toggles(self._toggles_data)
-                    # ★ 实时重注册热键（让保存立即生效）
-                    shell.pipeline.reregister_hotkeys()
-            except Exception:
-                pass
-        else:
-            print(f"[TogglesPage] 保存结果: 开关={toggle_ok}, 热键={hotkey_ok}", flush=True)
+        # ★ 从磁盘重新加载触发器数据，重建整个触发器开关区域
+        self._populate_triggers_section()
+        print(f"[TogglesPage] on_enter() 完成, 复选框数={len(self._trigger_checkboxes)}", flush=True)
 
     def _on_reset_defaults(self):
-        """恢复默认值。"""
-        # 功能开关恢复默认
+        """恢复默认值并即时保存。"""
+        # 功能开关恢复默认（阻断信号，避免每个 checkbox 触发一次保存）
         for key, default_val in _DEFAULT_VALUES.items():
             cb = self._checkboxes.get(key)
             if cb is not None:
+                cb.blockSignals(True)
                 cb.setChecked(default_val)
+                cb.blockSignals(False)
+            self._toggles_data[key] = default_val
 
         # 热键恢复默认
         for action_key, _, default_val in _HOTKEY_DEFS:
             edit = self._hotkey_edits.get(action_key)
             if edit is not None:
                 edit.value = default_val
+            self._hotkeys_data[action_key] = default_val
+
+        # 一次性保存
+        self._apply_toggles()
+        self._apply_hotkeys()
 
     def _get_shell(self):
         """获取 AppShell 实例。"""

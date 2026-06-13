@@ -22,6 +22,7 @@
 import json
 import sqlite3
 import threading
+import time
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -33,6 +34,9 @@ WM_API_ITEMS = "https://api.warframe.market/v2/items"
 WM_API_ORDERS = "https://api.warframe.market/v2/orders/item"
 REQUEST_TIMEOUT = 5
 MAX_WORKERS = 4
+_WM_FETCH_TIMEOUT = 15       # WM 物品列表请求超时(秒)
+_WM_FETCH_RETRIES = 2        # WM 物品列表重试次数
+_WM_RETRY_DELAY = 3          # 重试间隔(秒)
 
 
 class MarketPriceService:
@@ -197,14 +201,18 @@ _wm_items_cache: list[tuple[str, str, list[str]]] | None = None
 
 
 def fetch_wm_items(cache_ok: bool = True) -> list[tuple[str, str, list[str]]]:
-    """下载 warframe.market 全物品列表（带缓存）。
+    """下载 warframe.market 全物品列表（带缓存 + 重试）。
 
     返回 [(name, slug, tags), ...]，过滤掉遗物类物品。
+    网络异常时自动重试，全部失败后返回空列表（非致命错误）。
     """
     global _wm_items_cache
     with _ITEMS_CACHE_LOCK:
         if cache_ok and _wm_items_cache is not None:
             return _wm_items_cache
+
+    last_err = None
+    for attempt in range(_WM_FETCH_RETRIES + 1):
         try:
             req = urllib.request.Request(
                 WM_API_ITEMS,
@@ -214,10 +222,10 @@ def fetch_wm_items(cache_ok: bool = True) -> list[tuple[str, str, list[str]]]:
                     "Platform": "pc",
                 }
             )
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=_WM_FETCH_TIMEOUT) as resp:
                 data = json.loads(resp.read())
             items = data.get("data", [])
-            _wm_items_cache = [
+            result = [
                 (
                     i.get("i18n", {}).get("en", {}).get("name", ""),
                     i.get("slug", ""),
@@ -226,10 +234,19 @@ def fetch_wm_items(cache_ok: bool = True) -> list[tuple[str, str, list[str]]]:
                 for i in items
                 if "relic" not in i.get("tags", [])
             ]
-            return _wm_items_cache
+            with _ITEMS_CACHE_LOCK:
+                _wm_items_cache = result
+            return result
         except Exception as e:
-            print(f"[market_price] WM 物品列表加载失败: {e}")
-            return []
+            last_err = e
+            if attempt < _WM_FETCH_RETRIES:
+                print(f"[market_price] WM 物品列表加载失败 (第{attempt+1}/{_WM_FETCH_RETRIES+1}次): {e}"
+                      f"，{_WM_RETRY_DELAY}秒后重试...")
+                time.sleep(_WM_RETRY_DELAY)
+
+    print(f"[market_price] WM 物品列表加载失败（已耗尽重试）: {last_err}")
+    print("[market_price] 提示: 如果持续失败，请检查网络连接或代理设置")
+    return []
 
 
 def build_slug_map() -> dict[str, str]:

@@ -14,9 +14,11 @@ CyberSplashScreen — 赛博风格开启动画。
 
 from __future__ import annotations
 
+import json
 import math
 import random
 import time
+from pathlib import Path
 from typing import Optional, Callable
 
 from PySide6.QtWidgets import QWidget, QApplication
@@ -30,7 +32,7 @@ from core.widgets.base import CyberWidgetMixin
 
 # ── RELIC 像素字型定义 (16x20 网格 per 字母) ──
 # 超粗实心风格，笔画宽度 4-5 格，内部几乎填满
-_PIXEL_FONT: dict[str, list[list[int]]] = {
+_PIXEL_FONT_DEFAULT: dict[str, list[list[int]]] = {
     "R": [
         [0,0,1,1,1,1,1,1,1,1,1,0,0,0,0,0],
         [0,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0],
@@ -143,6 +145,45 @@ _PIXEL_FONT: dict[str, list[list[int]]] = {
     ],
 }
 
+
+# ── 外部像素字体 JSON 路径（打包后可写） ──
+_PIXEL_FONT_JSON_PATH = Path(__file__).resolve().parent.parent / "data" / "pixel_font.json"
+
+
+def _load_pixel_font() -> dict[str, list[list[int]]]:
+    """加载像素字体数据：优先从外部 JSON 读取，否则使用内置默认值。
+
+    外部文件 data/pixel_font.json 由像素字体编辑器生成，
+    打包后该路径位于可写的 data/ 目录下。
+    """
+    try:
+        if _PIXEL_FONT_JSON_PATH.exists():
+            with open(_PIXEL_FONT_JSON_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # 校验基本结构
+            if isinstance(data, dict) and all(
+                k in ("R", "E", "L", "I", "C") and isinstance(v, list)
+                for k, v in data.items()
+            ):
+                return data
+    except Exception:
+        pass
+    return _PIXEL_FONT_DEFAULT
+
+
+# 公开的像素字体变量（供 pixel_font_editor 等模块引用）
+_PIXEL_FONT = _load_pixel_font()
+
+
+def get_pixel_font_json_path() -> Path:
+    """获取像素字体外部 JSON 文件路径。"""
+    return _PIXEL_FONT_JSON_PATH
+
+
+def reload_pixel_font():
+    """重新加载像素字体数据（编辑器保存后调用）。"""
+    global _PIXEL_FONT
+    _PIXEL_FONT = _load_pixel_font()
 
 
 

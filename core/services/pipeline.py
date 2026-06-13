@@ -14,6 +14,7 @@
     threading.Thread(target=worker.run, daemon=True).start()
 """
 
+import sys
 import time
 from pathlib import Path
 
@@ -78,7 +79,11 @@ class DataPipelineWorker:
             self.progress_detail.emit(stage, cur, total)
 
     def run(self):
-        """执行完整流水线。"""
+        """执行完整流水线。
+
+        skip_download=True 时跳过步骤1（拉取源数据），
+        直接从 external/ 目录中已有的 JSON 文件构建数据库。
+        """
         results = {}
         start_time = time.time()
 
@@ -91,27 +96,34 @@ class DataPipelineWorker:
 
             # ============================================================
             # 步骤 1: 拉取源数据（3 个上游仓库 → external/）
+            #    skip_download 时跳过此步，直接使用本地已有文件
             # ============================================================
-            step_num += 1
-            self._emit_log("info", "=" * 50)
-            self._emit_log("info", f"[{step_num}/{total_steps}] 拉取源数据")
-            self._emit_step(step_num, "拉取源数据")
+            if not self._skip_download:
+                step_num += 1
+                self._emit_log("info", "=" * 50)
+                self._emit_log("info", f"[{step_num}/{total_steps}] 拉取源数据")
+                self._emit_step(step_num, "拉取源数据")
 
-            step_pct_start = int((step_num - 1) / total_steps * 100)
-            step_pct_end = int(step_num / total_steps * 100)
+                step_pct_start = int((step_num - 1) / total_steps * 100)
+                step_pct_end = int(step_num / total_steps * 100)
 
-            download_ok = self._run_step_download(step_pct_start, step_pct_end)
-            results["download"] = "ok" if download_ok else "failed"
+                download_ok = self._run_step_download(step_pct_start, step_pct_end)
+                results["download"] = "ok" if download_ok else "failed"
 
-            if not download_ok:
-                self._emit_log("error", "=" * 50)
-                self._emit_log("error", "源数据拉取失败，请检查网络后重试")
-                self._emit_log("error", "=" * 50)
-                results["success"] = False
-                results["error"] = "源数据拉取失败"
-                results["elapsed"] = time.time() - start_time
-                self.finished.emit(results)
-                return
+                if not download_ok:
+                    self._emit_log("error", "=" * 50)
+                    self._emit_log("error", "源数据拉取失败，请检查网络后重试")
+                    self._emit_log("error", "=" * 50)
+                    results["success"] = False
+                    results["error"] = "源数据拉取失败"
+                    results["elapsed"] = time.time() - start_time
+                    self.finished.emit(results)
+                    return
+            else:
+                step_num += 1  # 占位，保持步骤编号一致
+                self._emit_log("info", "=" * 50)
+                self._emit_log("info", f"[{step_num}/{total_steps}] 跳过拉取（使用本地文件）")
+                self._emit_step(step_num, "跳过拉取（使用本地文件）")
 
             # ============================================================
             # 步骤 2: 构建统一数据库 warframe.db
@@ -125,6 +137,15 @@ class DataPipelineWorker:
             step2_pct_end = int(step_num / total_steps * 100)
 
             build_stats = self._run_step_build_db(step2_pct_start, step2_pct_end)
+            if not build_stats:
+                # 构建失败（如缺少依赖），已通过 error 信号报告，直接结束
+                elapsed = time.time() - start_time
+                results["elapsed"] = elapsed
+                results["success"] = False
+                results.setdefault("error", "数据库构建失败")
+                self.finished.emit(results)
+                return
+
             results["build"] = build_stats
 
             # ============================================================
@@ -222,12 +243,13 @@ class DataPipelineWorker:
                         self._emit_log("warn", f"  代理 [{mirror_idx_orig}] 无法解析，跳过")
                         continue
 
+                    op_label = "更新" if (is_update and mirror_idx == 0) else "克隆"
                     self._emit_log("info",
                                     f"  尝试代理 [{mirror_idx_orig}] ({mirror_idx + 1}/{len(sorted_mirrors)})")
                     self.repo_progress.emit(
                         repo_name,
                         int(mirror_idx / len(sorted_mirrors) * 80),
-                        f"尝试代理 [{mirror_idx_orig}]...",
+                        f"{op_label}中... 代理[{mirror_idx_orig}]",
                     )
 
                     if is_update and mirror_idx == 0:
@@ -237,6 +259,13 @@ class DataPipelineWorker:
                             clone_url=clone_url,
                         )
                     else:
+                        # 克隆前发射一次明确状态
+                        _wfcd_log("info", f"  git clone {clone_url[:60]}...")
+                        self.repo_progress.emit(
+                            repo_name,
+                            int(mirror_idx / len(sorted_mirrors) * 80),
+                            f"git clone... 代理[{mirror_idx_orig}]",
+                        )
                         ok = init_fn(
                             log_callback=_wfcd_log,
                             progress_callback=_wfcd_progress,
@@ -283,8 +312,22 @@ class DataPipelineWorker:
     def _run_step_build_db(self, pct_start: int, pct_end: int) -> dict:
         """步骤2: 构建统一数据库 warframe.db。"""
         # 新版本：从 core/services 导入
-        from core.services.db_builder import build
-        from core.services.market_builder import build_market_items
+        try:
+            from core.services.db_builder import build
+            from core.services.market_builder import build_market_items
+        except ImportError as e:
+            missing = str(e)
+            if "pypinyin" in missing:
+                hint = ("缺少依赖 pypinyin，请在终端执行:\n"
+                        "  pip install pypinyin\n"
+                        "然后重新启动程序。\n\n"
+                        f"当前 Python: {sys.executable}\n"
+                        f"sys.path: {sys.path[:3]}...")
+            else:
+                hint = f"缺少依赖: {e}"
+            self._emit_log("error", f"构建数据库失败: {hint}")
+            self.error.emit(hint)
+            return {}
 
         def _build_log(msg: str):
             self._emit_log("info", msg)

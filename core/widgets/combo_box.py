@@ -85,6 +85,10 @@ class CyberComboBox(CyberWidgetMixin, QComboBox):
 
     # ── 事件 ──
 
+    def wheelEvent(self, event) -> None:
+        """禁用滚轮切换下拉选项，避免滚动页面时误改选项。"""
+        event.ignore()
+
     def enterEvent(self, event) -> None:
         self.cyber_enter_event(event)
 

@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import copy
-import re
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -24,12 +24,13 @@ from PySide6.QtGui import (
 )
 from PySide6.QtCore import Qt, Signal, QSize, QRectF, QObject
 
-# 引用 splash_screen 的字型数据
-from core.widgets.splash_screen import _PIXEL_FONT
+# 引用 splash_screen 的字型数据和 JSON 路径
+from core.widgets.splash_screen import _PIXEL_FONT, get_pixel_font_json_path, reload_pixel_font
+from core.widgets.button import CyberButton
 from core.tokens.manager import TokenManager
 
-# splash_screen.py 的路径（相对于本文件）
-_SPLASH_SCREEN_PATH = Path(__file__).resolve().parent / "splash_screen.py"
+# 像素字体外部 JSON 路径（打包后可写）
+_PIXEL_FONT_JSON_PATH = get_pixel_font_json_path()
 
 
 def _tc(key: str) -> str:
@@ -51,58 +52,23 @@ def _tc(key: str) -> str:
 _TM = TokenManager.instance()
 
 
-def _format_font_code(font_data: dict[str, list[list[int]]]) -> str:
-    """将字体数据格式化为 Python 字典代码。"""
-    lines = ['_PIXEL_FONT: dict[str, list[list[int]]] = {']
-    for ch in font_data:
-        grid = font_data[ch]
-        lines.append(f'    "{ch}": [')
-        for row in grid:
-            cells = ",".join(str(c) for c in row)
-            lines.append(f"        [{cells}],")
-        lines.append("    ],")
-    lines.append("}")
-    return "\n".join(lines) + "\n"
+def _save_font_to_json(font_data: dict[str, list[list[int]]]) -> tuple[bool, str]:
+    """将字体数据保存为外部 JSON 文件，返回 (是否成功, 错误信息)。
 
-
-def _save_font_to_file(font_data: dict[str, list[list[int]]]) -> bool:
-    """将字体数据写回 splash_screen.py，返回是否成功。"""
+    保存路径: data/pixel_font.json（打包后位于可写的 data/ 目录）。
+    """
     try:
-        src_path = _SPLASH_SCREEN_PATH
-        content = src_path.read_text(encoding="utf-8")
-
-        # 定位 _PIXEL_FONT 定义块的起止位置
-        start_pattern = re.compile(r"^_PIXEL_FONT:\s*dict\[str,\s*list\[list\[int\]\]\]\s*=\s*\{$", re.MULTILINE)
-        match = start_pattern.search(content)
-        if not match:
-            return False
-
-        start = match.start()
-        rest = content[start:]
-        # 从 { 开始逐行计算大括号深度，找到匹配的 }
-        brace_depth = 0
-        end_offset = 0
-        in_block = False
-        for i, ch in enumerate(rest):
-            if ch == "{":
-                brace_depth += 1
-                in_block = True
-            elif ch == "}":
-                brace_depth -= 1
-                if in_block and brace_depth == 0:
-                    end_offset = i + 1
-                    break
-
-        if end_offset == 0:
-            return False
-
-        # 替换并写回
-        new_code = _format_font_code(font_data)
-        new_content = content[:start] + new_code + content[start + end_offset:]
-        src_path.write_text(new_content, encoding="utf-8")
-        return True
-    except Exception:
-        return False
+        # 确保父目录存在
+        _PIXEL_FONT_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_PIXEL_FONT_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(font_data, f, ensure_ascii=False, indent=2)
+        return True, ""
+    except PermissionError:
+        return False, f"没有写入权限: {_PIXEL_FONT_JSON_PATH}"
+    except OSError as e:
+        return False, f"文件系统错误: {e}"
+    except Exception as e:
+        return False, str(e)
 
 
 class _WheelBlocker(QObject):
@@ -369,7 +335,7 @@ class PixelFontEditor(QDialog):
         layout.addWidget(splitter, 1)
 
         # 底部提示
-        hint = QLabel("提示: 左键点击切换单元格 | 调整行列后自动扩展/裁剪 | 导出后替换 splash_screen.py 中的 _PIXEL_FONT 数据")
+        hint = QLabel("提示: 左键点击切换单元格 | 调整行列后自动扩展/裁剪 | 保存后写入 data/pixel_font.json")
         hint.setStyleSheet(f"color: {_tc('alias.text.tertiary')}; font-size: 11px;")
         layout.addWidget(hint)
 
@@ -382,8 +348,13 @@ class PixelFontEditor(QDialog):
         rows = len(grid)
         cols = len(grid[0]) if grid else 14
 
+        # 阻断信号，避免 _on_grid_resize 在中间状态触发导致数据截断
+        self._rows_spin.blockSignals(True)
+        self._cols_spin.blockSignals(True)
         self._rows_spin.setValue(rows)
         self._cols_spin.setValue(cols)
+        self._rows_spin.blockSignals(False)
+        self._cols_spin.blockSignals(False)
 
         self._build_grid(rows, cols, grid)
         self._update_preview()
@@ -477,18 +448,24 @@ class PixelFontEditor(QDialog):
     # ── 保存 ──
 
     def _save(self) -> None:
-        """保存字体数据到 splash_screen.py。"""
-        ok = _save_font_to_file(self._font_data)
+        """保存字体数据到外部 JSON 文件。"""
+        ok, err_msg = _save_font_to_json(self._font_data)
         if ok:
+            # 通知 splash_screen 重新加载字体数据
+            try:
+                reload_pixel_font()
+            except Exception:
+                pass
             QMessageBox.information(
                 self, "保存成功",
-                f"已保存到 splash_screen.py！\n\n"
+                f"已保存到 pixel_font.json！\n\n"
+                f"路径: {_PIXEL_FONT_JSON_PATH}\n\n"
                 f"共 {sum(sum(row) for g in self._font_data.values() for row in g)} 个像素点"
             )
         else:
             QMessageBox.warning(
                 self, "保存失败",
-                f"无法写入 splash_screen.py，请检查文件权限。"
+                f"无法保存像素字体数据:\n{err_msg}"
             )
 
 
@@ -596,38 +573,65 @@ class _PixelFontEditorPanel(QFrame):
         layout.setContentsMargins(0, 4, 0, 4)
         layout.setSpacing(8)
 
-        # ── 第一行：字符按钮栏（所有字母横排展示）──
+        # ── 第一行：字母按钮栏 + 操作按钮 ──
         char_row = QHBoxLayout()
         char_row.setSpacing(4)
 
+        # 字母按钮区
         self._char_buttons: dict[str, QPushButton] = {}
         self._char_btn_layout = QHBoxLayout()
         self._char_btn_layout.setSpacing(3)
         char_row.addLayout(self._char_btn_layout)
 
-        char_row.addSpacing(6)
-
-        # 增删按钮
-        btn_add = QPushButton("+")
-        btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_add.setFixedSize(24, 24)
+        # 操作按钮（切角风格）
+        btn_add = CyberButton("+", variant="ghost")
+        btn_add.setFixedSize(28, 24)
         btn_add.setToolTip("添加新字母")
         btn_add.clicked.connect(self._add_letter)
         char_row.addWidget(btn_add)
 
-        btn_del = QPushButton("-")
-        btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_del.setFixedSize(24, 24)
+        btn_del = CyberButton("-", variant="ghost")
+        btn_del.setFixedSize(28, 24)
         btn_del.setToolTip("删除当前字母")
         btn_del.clicked.connect(self._del_letter)
         char_row.addWidget(btn_del)
+
+        # 重置全部按钮
+        btn_reset_all = CyberButton("重置全部", variant="outlined")
+        btn_reset_all.setFixedHeight(24)
+        btn_reset_all.setToolTip("将所有字母恢复为初始默认状态")
+        btn_reset_all.clicked.connect(self._reset_all)
+        char_row.addWidget(btn_reset_all)
 
         char_row.addStretch()
         layout.addLayout(char_row)
 
         self._rebuild_char_buttons()
 
-        # ── 第二行：行列参数 + 操作按钮 + 信息 ──
+        # ── 第二行：像素编辑网格 ──
+        grid_frame = QFrame()
+        _grid_bg = _tc("bg.base")
+        _grid_border = _tc("border.default")
+        grid_frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: {_grid_bg};
+                border: 1px solid {_grid_border};
+                border-radius: {_TM.space('corner.xs', 4)}px;
+            }}
+        """)
+        grid_outer = QVBoxLayout(grid_frame)
+        grid_outer.setContentsMargins(2, 2, 2, 2)
+        grid_outer.setSpacing(0)
+
+        self._grid_container = _GridContainer()
+        self._grid_layout = QGridLayout(self._grid_container)
+        self._grid_layout.setSpacing(1)
+        self._grid_layout.setContentsMargins(2, 2, 2, 2)
+
+        grid_outer.addWidget(self._grid_container)
+        layout.addWidget(grid_frame)
+
+        # ── 第三行：行列参数 + 操作按钮 + 信息（网格下方）──
         ctrl_row = QHBoxLayout()
         ctrl_row.setSpacing(8)
 
@@ -650,15 +654,13 @@ class _PixelFontEditorPanel(QFrame):
 
         ctrl_row.addSpacing(8)
 
-        btn_save = QPushButton("保存")
-        btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_save.setFixedWidth(48)
+        btn_save = CyberButton("保存", variant="solid")
+        btn_save.setFixedWidth(52)
         btn_save.clicked.connect(self._save)
         ctrl_row.addWidget(btn_save)
 
-        btn_reset = QPushButton("重置")
-        btn_reset.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_reset.setFixedWidth(48)
+        btn_reset = CyberButton("重置", variant="outlined")
+        btn_reset.setFixedWidth(52)
         btn_reset.clicked.connect(self._reset_current)
         ctrl_row.addWidget(btn_reset)
 
@@ -670,31 +672,7 @@ class _PixelFontEditorPanel(QFrame):
 
         layout.addLayout(ctrl_row)
 
-        # ── 第二行：网格（固定尺寸，不拉伸）──
-        grid_frame = QFrame()
-        _grid_bg = _tc("bg.base")
-        _grid_border = _tc("border.default")
-        grid_frame.setStyleSheet(f"""
-            QFrame {{
-                background-color: {_grid_bg};
-                border: 1px solid {_grid_border};
-                border-radius: {_TM.space('corner.xs', 4)}px;
-            }}
-        """)
-        grid_outer = QVBoxLayout(grid_frame)
-        grid_outer.setContentsMargins(2, 2, 2, 2)
-        grid_outer.setSpacing(0)
-
-        # 网格容器：固定尺寸，单元格紧密排列，支持拖拽绘制
-        self._grid_container = _GridContainer()
-        self._grid_layout = QGridLayout(self._grid_container)
-        self._grid_layout.setSpacing(1)
-        self._grid_layout.setContentsMargins(2, 2, 2, 2)
-
-        grid_outer.addWidget(self._grid_container)
-        layout.addWidget(grid_frame)
-
-        # ── 第三行：实时预览（放在下面）──
+        # ── 第四行：实时预览 ──
         preview_group = QFrame()
         preview_group.setStyleSheet(f"""
             QFrame {{
@@ -800,8 +778,15 @@ class _PixelFontEditorPanel(QFrame):
         grid = self._font_data.get(ch, [])
         rows = len(grid)
         cols = len(grid[0]) if grid else 14
+
+        # 阻断信号，避免 _on_grid_resize 在中间状态触发导致数据截断
+        self._rows_spin.blockSignals(True)
+        self._cols_spin.blockSignals(True)
         self._rows_spin.setValue(rows)
         self._cols_spin.setValue(cols)
+        self._rows_spin.blockSignals(False)
+        self._cols_spin.blockSignals(False)
+
         self._build_grid(rows, cols, grid)
         self._highlight_active_button()
         self._update_preview()
@@ -856,11 +841,20 @@ class _PixelFontEditorPanel(QFrame):
         self._update_info()
 
     def _reset_current(self) -> None:
+        """重置当前字母为 _PIXEL_FONT 中的初始数据。"""
         ch = self._current_char
         original = _PIXEL_FONT.get(ch, [])
         if original:
             self._font_data[ch] = [row[:] for row in original]
         self._load_letter(ch)
+
+    def _reset_all(self) -> None:
+        """将所有字母恢复为 _PIXEL_FONT 的初始默认状态（含被删除的字母）。"""
+        self._font_data.clear()
+        for ch, grid in _PIXEL_FONT.items():
+            self._font_data[ch] = [row[:] for row in grid]
+        self._rebuild_char_buttons()
+        self._load_letter("R")
 
     def _update_preview(self) -> None:
         self._preview_label.set_font_data(
@@ -879,17 +873,21 @@ class _PixelFontEditorPanel(QFrame):
         )
 
     def _save(self) -> None:
-        """保存字体数据到 splash_screen.py。"""
-        ok = _save_font_to_file(self._font_data)
+        """保存字体数据到外部 JSON 文件。"""
+        ok, err_msg = _save_font_to_json(self._font_data)
         if ok:
+            try:
+                reload_pixel_font()
+            except Exception:
+                pass
             QMessageBox.information(
                 self, "保存成功",
-                f"已保存到 splash_screen.py！"
+                f"已保存到 pixel_font.json！\n路径: {_PIXEL_FONT_JSON_PATH}"
             )
         else:
             QMessageBox.warning(
                 self, "保存失败",
-                f"无法写入 splash_screen.py，请检查文件权限。"
+                f"无法保存像素字体数据:\n{err_msg}"
             )
 
 

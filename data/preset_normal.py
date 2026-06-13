@@ -35,6 +35,10 @@ STRINGS = {
         "selection_status_idle":   "",
         "selection_status_released": "",
         "mode_selected":           "已选择功能: {mode}",
+        "price_query_summary":     "价格查询完成: 共 {total} 项, 查询 {queried} 项, 结果 {results} 条",
+        "price_ingame_sellers":    "{count} 位在线卖家",
+        "no_price_data":           "未获取到价格数据",
+        "region_saved":            "区域已保存: ({l},{t})-({r},{b}) {w}x{h}",
     },
 
     # ── 快捷键标签 ──
@@ -42,6 +46,12 @@ STRINGS = {
         "label_select":       "区域选择",
         "label_fullscreen":   "全屏捕获",
         "label_query_price":  "查询价格",
+        "label_eye_mask":     "护眼遮罩",
+    },
+
+    # ── 导航标签 ──
+    "nav": {
+        "eye_mask": "护眼遮罩",
     },
 
     # ── 功能开关标签 ──

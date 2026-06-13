@@ -526,7 +526,7 @@ copy:
   # ---- 物品查询页 ----
   items:
     title: "物品检索"
-    desc: "搜索遗物内含物品、Prime 部件、蓝图等"
+    desc: "全物品查询"
     card_search: "搜索条件"
     card_result: "搜索结果"
     label_keyword: "关键词:"
@@ -538,7 +538,7 @@ copy:
     card_detail: "遗物详情"
     detail_hint: "点击上方结果查看详细信息"
     label_keyword: "关键词:"
-    placeholder_search: "输入遗物名称，如 Axi A1、Lith S2..."
+    placeholder_search: "输入任意物品名称"
     status_vaulted: "已入库 (Vaulted)"
     status_available: "可获取 (Available)"
     label_contents: "内含物品"
@@ -703,6 +703,10 @@ copy:
     btn_reset: "恢复默认"
     tip_saved: "设置已保存"
     tip_restart: "部分修改需要重启应用后生效"
+    group_triggers: "辅助触发器"
+    triggers_desc: "管理辅助触发器的启用/禁用状态，详细配置请前往「辅助触发器」页面"
+    trigger_empty: "暂无触发器"
+    trigger_goto_config: "前往配置"
 
   # ---- 语言预设页 ----
   preset:

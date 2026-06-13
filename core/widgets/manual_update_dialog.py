@@ -1,0 +1,206 @@
+"""
+ManualUpdateDialog — 手动更新数据教程对话框。
+
+赛博风格对话框，展示：
+  - 数据源文件下载地址（可选中复制）
+  - 文件放置路径说明
+  - 操作步骤指南
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+    QFrame, QApplication,
+)
+from PySide6.QtGui import QFont, QColor
+from PySide6.QtCore import Qt
+
+from core.widgets.base import CyberWidgetMixin
+from core.widgets.button import CyberButton
+from core.tokens.manager import TokenManager
+
+
+class _CopyableLabel(QLabel):
+    """可选中复制的文本标签。"""
+
+    def __init__(self, text: str = "", parent=None):
+        QLabel.__init__(self, text, parent)
+        self.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        self.setWordWrap(True)
+
+
+class ManualUpdateDialog(CyberWidgetMixin, QDialog):
+    """手动更新数据教程对话框。
+
+    展示数据源文件的下载地址、放置位置和操作步骤。
+    链接和路径均可选中复制。
+    """
+
+    # ── 数据源定义 ──
+    REPOS = [
+        {
+            "name": "warframe-items",
+            "desc": "遗物 / 物品数据",
+            "url": "https://github.com/WFCD/warframe-items",
+            "files": ["All.json", "i18n.json", "Relics.json"],
+            "target": "external/warframe-items_sparse/data/json/",
+        },
+        {
+            "name": "warframe-drop-data",
+            "desc": "掉落数据",
+            "url": "https://github.com/WFCD/warframe-drop-data",
+            "files": ["all.json"],
+            "target": "external/warframe-drop-data_sparse/data/",
+        },
+        {
+            "name": "warframe-public-export-plus",
+            "desc": "翻译数据",
+            "url": "https://github.com/WFCD/warframe-public-export-plus",
+            "files": ["dict.en.json", "dict.zh.json"],
+            "target": "external/warframe-i18n_sparse/",
+        },
+    ]
+
+    def __init__(self, parent=None):
+        QDialog.__init__(self, parent)
+        self.setWindowTitle("手动更新数据 — 教程")
+        self.setMinimumSize(580, 520)
+        self.setModal(True)
+
+        _tm = TokenManager.instance()
+        _bg = _tm.get_qcolor("bg.base")
+        _bg_raised = _tm.get_qcolor("bg.raised")
+        _text_pri = _tm.get_qcolor("text.primary")
+        _text_sec = _tm.get_qcolor("text.secondary")
+        _text_ter = _tm.get_qcolor("text.tertiary")
+        _border = _tm.get_qcolor("border.default")
+        _accent = _tm.get_qcolor("accent.primary")
+        _accent_sec = _tm.get_qcolor("accent.secondary")
+
+        self.setStyleSheet(f"""
+            QDialog {{
+                background-color: {_bg.name()};
+                color: {_text_pri.name()};
+            }}
+            QLabel {{
+                color: {_text_sec.name()};
+                font-size: 12px;
+                background: transparent;
+                border: none;
+            }}
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(14)
+
+        # ── 标题 ──
+        title = QLabel("手动更新数据 — 教程")
+        title.setFont(QFont("Iceberg", 15))
+        title.setStyleSheet(f"color: {_accent.name()}; background: transparent; border: none;")
+        layout.addWidget(title)
+
+        # ── 说明文字 ──
+        hint = QLabel(
+            "当自动拉取 GitHub 数据失败时，可以手动下载数据源文件，"
+            "放到指定目录后点击「手动构建数据库」按钮完成更新。\n"
+            "下方链接和路径均可鼠标选中后 Ctrl+C 复制。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {_text_ter.name()}; background: transparent; border: none;")
+        layout.addWidget(hint)
+
+        # ── 各仓库信息卡片 ──
+        for repo in self.REPOS:
+            card = self._build_repo_card(repo)
+            layout.addWidget(card)
+
+        # ── 底部按钮行 ──
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        btn_close = CyberButton(text="关闭", variant="ghost")
+        btn_close.setFixedWidth(80)
+        btn_close.clicked.connect(self.close)
+        btn_row.addWidget(btn_close)
+
+        layout.addLayout(btn_row)
+
+    def _build_repo_card(self, repo: dict) -> QFrame:
+        """构建单个仓库的信息卡片。"""
+        _tm = TokenManager.instance()
+        _bg_raised = _tm.get_qcolor("bg.raised")
+        _text_pri = _tm.get_qcolor("text.primary")
+        _text_sec = _tm.get_qcolor("text.secondary")
+        _text_ter = _tm.get_qcolor("text.tertiary")
+        _border = _tm.get_qcolor("border.default")
+        _accent = _tm.get_qcolor("accent.primary")
+        _accent_sec = _tm.get_qcolor("accent.secondary")
+
+        card = QFrame()
+        card.setObjectName(f"manualUpdateCard_{repo['name']}")
+        _card_bg = _tm.get_qcolor("bg.base")
+        _card_bg.setAlphaF(0.75)
+        card.setStyleSheet(f"""
+            QFrame#manualUpdateCard_{repo['name']} {{
+                background-color: rgba({_card_bg.red()}, {_card_bg.green()}, {_card_bg.blue()}, 0.75);
+                border: 1px solid {_border.name()}60;
+                border-radius: {TokenManager.instance().space('corner.sm', 6)}px;
+            }}
+        """)
+
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(14, 10, 14, 10)
+        cl.setSpacing(6)
+
+        # 仓库名 + 描述
+        header = QHBoxLayout()
+        name_lbl = QLabel(f"[{repo['name']}]")
+        name_lbl.setFont(QFont("", 11))
+        name_lbl.setStyleSheet(
+            f"color: {_accent.name()}; background: transparent; border: none; font-weight: bold;"
+        )
+        header.addWidget(name_lbl)
+
+        desc_lbl = QLabel(repo["desc"])
+        desc_lbl.setStyleSheet(
+            f"color: {_text_sec.name()}; background: transparent; border: none;"
+        )
+        header.addWidget(desc_lbl)
+        header.addStretch()
+        cl.addLayout(header)
+
+        # GitHub 链接（可选中复制）
+        url_lbl = _CopyableLabel(repo["url"])
+        url_lbl.setStyleSheet(
+            f"color: {_accent_sec.name()}; "
+            f"background: rgba({_accent_sec.red()}, {_accent_sec.green()}, {_accent_sec.blue()}, 8); "
+            f"border: 1px solid {_border.name()}40; "
+            f"border-radius: 4px; padding: 4px 8px; font-family: Consolas, monospace;"
+        )
+        cl.addWidget(url_lbl)
+
+        # 所需文件
+        files_text = "文件: " + ", ".join(repo["files"])
+        files_lbl = _CopyableLabel(files_text)
+        files_lbl.setStyleSheet(
+            f"color: {_text_ter.name()}; background: transparent; border: none; "
+            f"font-size: 11px;"
+        )
+        cl.addWidget(files_lbl)
+
+        # 放置路径（可选中复制）
+        target_lbl = _CopyableLabel(f"放置到: {repo['target']}")
+        target_lbl.setStyleSheet(
+            f"color: {_text_sec.name()}; background: transparent; border: none; "
+            f"font-family: Consolas, monospace; font-size: 11px;"
+        )
+        cl.addWidget(target_lbl)
+
+        return card

@@ -1,6 +1,6 @@
 [
   {
-    "name": "GAUSS",
+    "name": "GAUSS枪架",
     "enabled": false,
     "trigger_input": {
       "type": "mouse",
@@ -11,6 +11,36 @@
       {
         "type": "key",
         "value": "3"
+      }
+    ]
+  },
+  {
+    "name": "女枪开镜自动4",
+    "enabled": false,
+    "trigger_input": {
+      "type": "mouse",
+      "button": "right_press"
+    },
+    "delay_ms": 10,
+    "actions": [
+      {
+        "type": "key",
+        "value": "4"
+      }
+    ]
+  },
+  {
+    "name": "女枪开镜自动4.2",
+    "enabled": false,
+    "trigger_input": {
+      "type": "mouse",
+      "button": "right_release"
+    },
+    "delay_ms": 10,
+    "actions": [
+      {
+        "type": "key",
+        "value": "4"
       }
     ]
   }

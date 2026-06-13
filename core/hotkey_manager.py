@@ -213,6 +213,8 @@ class HotkeyManager(QAbstractNativeEventFilter):
         # 第二步：注册新热键
         action_map = {
             "select": "select", "fullscreen": "fullscreen",
+            "query_price": "query_price",  # CTRL+T 价格查询
+            "eye_mask": "eye_mask",
         }
 
         success_count = 0

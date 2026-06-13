@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import sys
 import time
-from typing import Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -235,7 +234,6 @@ class TriggersPage(PageBase):
 
     def __init__(self):
         self._trigger_card_widgets: list[dict] = []
-        self._trigger_save_timer: Optional[QTimer] = None
 
         super().__init__()
         self.page_title = self._copy("nav.triggers", "Triggers")
@@ -272,12 +270,6 @@ class TriggersPage(PageBase):
         )
         desc.setWordWrap(True)
         layout.addWidget(desc)
-
-        # ── 防抖保存计时器 ──
-        self._trigger_save_timer = QTimer()
-        self._trigger_save_timer.setSingleShot(True)
-        self._trigger_save_timer.setInterval(300)
-        self._trigger_save_timer.timeout.connect(self._save_all_triggers)
 
         # ── 卡片容器 ──
         self._cards_container = QWidget()
@@ -530,7 +522,7 @@ class TriggersPage(PageBase):
         cl.addLayout(del_row)
 
         # ────────────────────────────────
-        #  变化回调（防抖保存 + 更新摘要）
+        #  变化回调（即时保存 + 更新摘要）
         # ────────────────────────────────
         def on_change_fn():
             # 同步卡片标题
@@ -544,7 +536,7 @@ class TriggersPage(PageBase):
                 mouse_btn_combo, kb_key_input, delay_spin,
                 action_widgets_list,
             )
-            self._trigger_save_timer.start()
+            self._save_all_triggers()
 
         # 连接名称和触发器字段信号
         name_input.textChanged.connect(on_change_fn)
@@ -681,7 +673,7 @@ class TriggersPage(PageBase):
         def _on_pick_position(x: int, y: int):
             coord_text = f"{x}, {y}"
             move_coord_label.setText(coord_text)
-            self._trigger_save_timer.start()  # 触发防抖保存
+            self._save_all_triggers()  # 即时保存
 
         btn_pick_pos.clicked.connect(self._open_crosshair_picker(_on_pick_position))
 
@@ -786,7 +778,7 @@ class TriggersPage(PageBase):
         cw = self._build_trigger_card(blank, parent_layout)
         parent_layout.addWidget(cw["card"])
         self._trigger_card_widgets.append(cw)
-        self._trigger_save_timer.start()
+        self._save_all_triggers()
 
     def _on_delete_trigger_card(self, card: CyberCard):
         reply = QMessageBox.question(
@@ -807,7 +799,7 @@ class TriggersPage(PageBase):
         card.hide()
         card.setParent(None)
         card.deleteLater()
-        self._trigger_save_timer.start()
+        self._save_all_triggers()
 
     def _on_delete_action_row(self, action_widget: dict, parent_cw: dict):
         aw = action_widget
@@ -824,12 +816,111 @@ class TriggersPage(PageBase):
                 ctrl.setParent(None)
                 ctrl.deleteLater()
 
-        self._trigger_save_timer.start()
+        self._save_all_triggers()
 
     def _on_status_toggle(self, bar: _TriggerStatusBar, checked: bool):
         _ui_log(f"status_toggle() | trigger='{bar._name}' | "
                 f"enabled={checked}", "UI_TOGGLE")
-        self._trigger_save_timer.start()
+        # ★ 即时保存，对端页面（TogglesPage）在 on_enter 时从磁盘读取最新状态。
+        self._save_all_triggers()
+
+    # ════════════════════════════════════
+    #  页面生命周期
+    # ════════════════════════════════════
+
+    def on_enter(self):
+        """页面进入时从磁盘重新加载触发器数据，同步状态栏。
+
+        确保在开关页面修改后，返回本页时状态栏与磁盘数据一致。
+        """
+        current_data = load_triggers()
+
+        # 数量不一致 → 完全重建（由 build_content 处理，最简单的方式是重载整个页面）
+        if len(current_data) != len(self._trigger_card_widgets):
+            # 触发重建：移除旧内容，重新构建
+            container = self.layout().itemAt(0).widget()
+            if container:
+                old_layout = container.layout()
+                if old_layout:
+                    while old_layout.count():
+                        item = old_layout.takeAt(0)
+                    container.setParent(None)
+                    container.deleteLater()
+            # 重建内容
+            new_content = self.build_content()
+            self.layout().addWidget(new_content)
+            return
+
+        # 数量一致 → 只同步 enabled 状态
+        for i, cw in enumerate(self._trigger_card_widgets):
+            bar = cw.get("status_bar")
+            if bar is None:
+                continue
+            disk_enabled = bool(current_data[i].get("enabled", False))
+            if bar._enabled != disk_enabled:
+                name_input = cw.get("name_input")
+                name = name_input.text().strip() if name_input else ""
+                summary = self._build_summary_from_card(cw)
+                bar.blockSignals(True)
+                bar.set_state(disk_enabled, name, summary)
+                bar.blockSignals(False)
+
+    def on_leave(self):
+        """页面离开时确保数据已持久化。"""
+        self._save_all_triggers()
+        _ui_log("on_leave() → 已强制保存触发器状态", "UI_LIFECYCLE")
+
+    def _build_summary_from_card(self, cw: dict) -> str:
+        """从卡片控件字典读取当前值，生成触发器摘要文本。"""
+        ttc = cw.get("trigger_type_combo")
+        mbc = cw.get("mouse_btn_combo")
+        kbi = cw.get("kb_key_input")
+        dsp = cw.get("delay_spin")
+        awl = cw.get("action_widgets", [])
+
+        ti_type = "mouse"
+        if ttc is not None:
+            idx = ttc.currentIndex()
+            ti_type = TRIGGER_INPUT_TYPES[idx] if idx < len(TRIGGER_INPUT_TYPES) else "mouse"
+
+        trigger_input = {"type": ti_type}
+        if ti_type == "mouse" and mbc is not None:
+            midx = mbc.currentIndex()
+            trigger_input["button"] = (
+                MOUSE_BUTTON_VALUES[midx] if midx < len(MOUSE_BUTTON_VALUES) else "right"
+            )
+        elif ti_type == "keyboard" and kbi is not None:
+            trigger_input["key"] = kbi.value
+
+        delay = int(dsp.value()) if dsp else 0
+
+        actions = []
+        for aw in awl:
+            tc = aw.get("type_combo")
+            if tc is None:
+                continue
+            aidx = tc.currentIndex()
+            atype = ACTION_TYPES[aidx] if aidx < len(ACTION_TYPES) else "key"
+            action = {"type": atype}
+            if atype in ("key", "hold"):
+                val_edit = aw.get("value_edit")
+                action["value"] = int(val_edit.text()) if val_edit and val_edit.text().isdigit() else 1
+            elif atype == "mouse_click":
+                mcc = aw.get("mouse_click_combo")
+                if mcc is not None:
+                    mcidx = mcc.currentIndex()
+                    action["button"] = (
+                        MOUSE_CLICK_VALUES[mcidx] if mcidx < len(MOUSE_CLICK_VALUES) else "left"
+                    )
+            actions.append(action)
+
+        return format_trigger_summary({
+            "name": "",
+            "enabled": True,
+            "trigger_input": trigger_input,
+            "delay_ms": delay,
+            "actions": actions,
+        })
 
     # ════════════════════════════════════
     #  数据持久化

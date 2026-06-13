@@ -24,7 +24,13 @@ import urllib.error
 from pathlib import Path
 from typing import Optional, Callable
 
-from pypinyin import lazy_pinyin, Style
+try:
+    from pypinyin import lazy_pinyin, Style
+    _HAS_PYPINYIN = True
+except ImportError:
+    _HAS_PYPINYIN = False
+    lazy_pinyin = None
+    Style = None
 
 # ============================================================
 # 路径常量
@@ -642,10 +648,13 @@ def build(
             "SELECT unique_name, zh_name FROM items WHERE zh_name IS NOT NULL AND zh_name != ''"
         ).fetchall()
         py_updates = []
-        for row in py_rows:
-            py_str = ''.join(lazy_pinyin(row[1], style=Style.NORMAL))
-            if py_str:
-                py_updates.append((py_str.lower(), row[0]))
+        if _HAS_PYPINYIN:
+            for row in py_rows:
+                py_str = ''.join(lazy_pinyin(row[1], style=Style.NORMAL))
+                if py_str:
+                    py_updates.append((py_str.lower(), row[0]))
+        else:
+            _log("  [!] pypinyin 未安装，跳过拼音生成")
         cur.executemany("UPDATE items SET zh_pinyin=? WHERE unique_name=?", py_updates)
         conn.commit()
         stats['pinyin_generated'] = len(py_updates)

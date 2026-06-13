@@ -110,6 +110,7 @@ class ScreenshotPipelineService:
         self.log_emitted = EventEmitter()       # (level, message)
         self.ready_changed = EventEmitter()      # (is_ready)
         self.ocr_finished = EventEmitter()       # (ocr_type, results)
+        self.eye_mask_toggled = EventEmitter()   # 护眼遮罩切换信号
 
         # ── UI 层 ──
         self._overlay = None
@@ -138,11 +139,13 @@ class ScreenshotPipelineService:
         self._camera = None
         self._relic_ocr = None
         self._item_ocr = None
+        self._price_ocr = None  # ★ PPOCRv3 价格查询专用识别器
         self._relic_db = None
 
         # ── 就绪标志 ──
         self._ocr_ready = False
         self._camera_ready = False
+        self._price_ocr_ready = False  # ★ 价格 OCR 就绪标志
         self._all_ready = False
 
         # ── 热键管理器 ──
@@ -221,6 +224,18 @@ class ScreenshotPipelineService:
                 self._item_ocr = ItemNameRecognizer()
                 self._ocr_ready = True
                 self._log("ok", "OCR 引擎初始化完成 (遗物 + 物品)")
+
+                # 3.5 价格查询专用 OCR (PPOCRv3 ONNX)
+                self._log("info", "正在加载价格查询 OCR 模型 (PP-OCRv3)...")
+                try:
+                    from core.recognizers.ppocr_v3 import PPOCRv3Recognizer
+                    self._price_ocr = PPOCRv3Recognizer()
+                    self._price_ocr_ready = True
+                    self._log("ok", "价格 OCR 引擎初始化完成 (PP-OCRv3)")
+                except Exception as e:
+                    self._log("warn", f"价格 OCR 加载失败（CTRL+T 不可用）: {e}")
+                    self._price_ocr = None
+                    self._price_ocr_ready = False
 
                 # 4. 遗物数据库
                 self._log("info", "正在加载数据库...")
@@ -302,6 +317,12 @@ class ScreenshotPipelineService:
             return
         self._hotkey_mgr.last_action_time = now
 
+        # 护眼遮罩不依赖摄像头/OCR，直接发射信号
+        if action == 'eye_mask':
+            self._log("info", "护眼遮罩切换", source="_on_hotkey")
+            self.eye_mask_toggled.emit()
+            return
+
         if not self._camera_ready:
             self._log("warn", "摄像头正在初始化，请稍候...", source="_on_hotkey")
             return
@@ -320,6 +341,17 @@ class ScreenshotPipelineService:
             self._overlay._hide_mode_buttons()
             self._overlay.label.clear()
             self._do_fullscreen_screenshot()
+        elif action == 'query_price':
+            # CTRL+T 价格查询：启动框选模式
+            self._log("info", "价格查询: 启动框选", source="_on_hotkey")
+            if not self._price_ocr_ready:
+                from data.ui_strings import S
+                self._log("warn", "价格 OCR 引擎正在初始化，请稍候...", source="_on_hotkey")
+                self._overlay.display(S("overlay", "ocr_recognizing"), auto_hide_ms=2000)
+                return
+            # 启动框选，标记为价格查询模式
+            self._pending_mode = 'query_price'
+            self._overlay.start_selection()
 
     # ════════════════════════════════════
     #  框选截图
@@ -351,7 +383,13 @@ class ScreenshotPipelineService:
             self._overlay.display(S("overlay", "screenshot_failed"), auto_hide_ms=3000)
             return
 
-        self._after_screenshot(frame, logical)
+        # ★ 判断是否为价格查询模式（全屏 GDI 截图 + 区域过滤）
+        if self._pending_mode == 'query_price':
+            # ★ 全屏截图在 _do_query_price 内部执行，这里只传递框选区域用于过滤
+            self._do_query_price(frame, logical)
+            self._pending_mode = None
+        else:
+            self._after_screenshot(frame, logical)
 
     # ════════════════════════════════════
     #  全屏截图
@@ -427,6 +465,124 @@ class ScreenshotPipelineService:
         else:
             from data.ui_strings import S
             self._overlay.display(S("overlay", "screenshot_done"), auto_hide_ms=3000)
+
+    # ════════════════════════════════════
+    #  价格查询（CTRL+T 专用流程）
+    # ════════════════════════════════════
+
+    def _do_query_price(self, frame, region):
+        """价格查询完整流程：全屏 GDI 截图 → PPOCRv3 OCR（区域过滤）→ 纠错 → WM API → 显示。
+
+        与原项目 WarframeMonitor 一致：使用全屏截图保证 DB-Net 像素密度，
+        用户框选区域仅用于过滤 OCR 结果。
+
+        Args:
+            frame: dxcam 框选截图帧 (此参数保留兼容，实际使用 GDI 全屏截图)
+            region: 逻辑坐标区域 (left, top, right, bottom)，用作 OCR 结果过滤
+        """
+        if not self._price_ocr or not self._price_ocr_ready:
+            from data.ui_strings import S
+            self._overlay.display(S("overlay", "db_not_ready"), auto_hide_ms=2000)
+            return
+
+        from data.ui_strings import S
+
+        # 保存状态
+        self._last_region = region
+
+        # 显示提示
+        self._overlay.show()
+        self._overlay.raise_()
+        self._overlay.activateWindow()
+        self._overlay.display(
+            S.format("overlay", "fullscreen_info", w=region[2]-region[0], h=region[3]-region[1]),
+            auto_hide_ms=2000
+        )
+
+        # 启动后台线程执行 OCR + 查询
+        def _run_price_query():
+            try:
+                self._log("info", "价格查询: GDI 截图 + 区域裁剪 OCR", source="_do_query_price")
+
+                # ★ 全屏 GDI 截图
+                from core.services.gdi_capture import gdi_capture_fullscreen
+                full_frame = gdi_capture_fullscreen()
+                if full_frame is None:
+                    self._log("error", "价格查询: GDI 全屏截图失败", source="_do_query_price")
+                    self._invoke_on_main(
+                        lambda: self._overlay.display(S("overlay", "screenshot_failed"), auto_hide_ms=3000)
+                    )
+                    return
+
+                # ★ 关键：先裁剪到用户框选区域，再送入 OCR（与原项目一致）
+                # 原项目只对目标小区域做 OCR，避免全屏 UI 噪声干扰
+                left, top, right, bottom = region
+                cropped = full_frame[top:bottom, left:right]
+
+                # ★ 保存裁剪区域用于调试
+                import cv2, os
+                _dbg = os.path.join(os.path.dirname(__file__), '..', '..', 'debug_ocr')
+                os.makedirs(_dbg, exist_ok=True)
+                cv2.imwrite(os.path.join(_dbg, 'ocr_cropped_input.png'),
+                            cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB) if len(cropped.shape) == 3 and cropped.shape[2] == 3 else cropped)
+
+                if cropped.size == 0 or cropped.shape[0] < 20 or cropped.shape[1] < 20:
+                    self._log("warn", "价格查询: 裁剪区域过小", source="_do_query_price")
+                    self._invoke_on_main(
+                        lambda: self._overlay.display(S("overlay", "no_text_detected"), auto_hide_ms=3000)
+                    )
+                    return
+
+                # 对裁剪后的小图做 OCR（不需要 filter_region）
+                ocr_results = self._price_ocr.recognize(cropped)
+
+                # ★ 坐标偏移：裁剪图坐标 → 全屏坐标（用于 Overlay 标注）
+                off_x, off_y = left, top
+                ocr_results = [
+                    (text, [[p[0] + off_x, p[1] + off_y] for p in box], score)
+                    for text, box, score in ocr_results
+                ]
+
+                if not ocr_results:
+                    self._log("warn", "价格查询: 未检测到文字", source="_do_query_price")
+                    self._invoke_on_main(
+                        lambda: self._overlay.display(S("overlay", "no_text_detected"), auto_hide_ms=3000)
+                    )
+                    return
+
+                self._log("info", f"价格查询: 识别到 {len(ocr_results)} 条", source="_do_query_price")
+
+                dpi = self._overlay._dpi_scale
+                from core.mode_handlers import handle_query_price
+
+                handle_query_price(ocr_results, region, dpi, self._overlay)
+
+                timing = self._price_ocr.get_timing()
+                self._log("ok",
+                          f"价格查询完成 | {timing.get('total', 0):.0f}ms "
+                          f"(检测 {timing.get('db_net', 0):.0f}ms)",
+                          source="_do_query_price")
+
+            except Exception as e:
+                self._log("error", f"价格查询异常: {e}", source="_do_query_price")
+                import traceback
+                traceback.print_exc()
+                error_msg = f"价格查询失败: {e}"
+                self._invoke_on_main(
+                    lambda msg=error_msg: self._overlay.display(msg, auto_hide_ms=4000)
+                )
+
+        # 在后台线程运行
+        t = threading.Thread(target=_run_price_query, daemon=True, name="PriceQuery")
+        t.start()
+
+    def _invoke_on_main(self, fn, *args, **kwargs):
+        """确保 fn 在主线程执行（用于从后台线程更新 UI）。"""
+        if hasattr(self._overlay, '_invoke_on_main'):
+            self._overlay._invoke_on_main(fn, *args, **kwargs)
+        else:
+            # 兼容旧版本
+            fn(*args, **kwargs)
 
     def _start_eager_ocr(self, enabled_modes: list[str]):
         """截图后立即启动 OCR，让用户点击按钮时结果已就绪。"""

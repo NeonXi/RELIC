@@ -18,6 +18,7 @@ DEFAULT_HOTKEYS = {
     "select": "ctrl+g",           # 框选截图
     "fullscreen": "ctrl+h",       # 全屏截图
     "query_price": "ctrl+t",  # 价格查询（4等分截图+识别+标注）
+    "eye_mask": "ctrl+j",     # 护眼遮罩 开关
 }
 
 # 可用的修饰键
@@ -28,6 +29,7 @@ HOTKEY_LABELS = {
     "select": S("hotkey", "label_select"),
     "fullscreen": S("hotkey", "label_fullscreen"),
     "query_price": S("hotkey", "label_query_price"),
+    "eye_mask": S("hotkey", "label_eye_mask"),
 }
 
 
