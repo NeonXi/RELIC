@@ -20,6 +20,21 @@ core.tokens — Design Token 系统。
 
     color = tm.get("components.button.solid.fill")  → "#FFE600"
     height = tm.space("height.btn_md")               → 36
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L-Infrastructure] (core/tokens/)
+允许依赖:  PyYAML, Python 标准库
+禁止依赖:  PySide6 / QtWidgets / QtCore(任何 Qt 命名空间)
+           (Token 是数据层,不能引入 UI)
+必读规范:  .trae/rules/开发规范.md §6.1
+
+本文件相关红线:
+- 禁止 import PySide6 → Token 不能依赖 UI
+- 禁止返回 Qt 对象 → 只能返回 str / int / dict
+- 禁止在 Token 里持有 widget 引用
+- 禁止在 Token 中做 IO(读文件应该 lazy)
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.1。
 """
 
 from core.tokens.color_utils import (

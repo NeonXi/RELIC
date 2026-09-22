@@ -1,16 +1,35 @@
 """
-统一 OCR 管线基类
+[L-Recognizer] BaseOCR — 统一 OCR 管线基类
 
-提取三个识别器（RelicNameRecognizer / ItemNameRecognizer / ModNameRecognizer）
-的公共样板代码：
+提取三个识别器(RelicNameRecognizer / ItemNameRecognizer / ModNameRecognizer)
+的公共样板代码:
   - RapidOCR 初始化
   - 图片上采样
-  - OCR 结果迭代（去空、垃圾过滤）
+  - OCR 结果迭代(去空、垃圾过滤)
   - 坐标缩放
   - 垂直相邻行合并（处理跨行文本）
   - 耗时统计
 
 子类只需实现 _build_lines() 返回 [(text, box), ...]，即可复用完整管线。
+
+依赖: numpy + opencv-python + rapidocr-onnxruntime（可选）
+被谁用: relic_name / item_name / mod_name 三个具体识别器
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L-Recognizer] (core/recognizers/)
+允许依赖:  numpy, onnxruntime, opencv-python, sqlite3, rapidocr-onnxruntime
+禁止依赖:  core.widgets/* / core.pages/* / core.state/*
+           (不能调 UI,只能输出结构化结果)
+必读规范:  .trae/rules/开发规范.md §6.3
+
+本文件相关红线:
+- 禁止返回 Qt 控件 → 只能返回 dict(含 en_name / zh_name / slug / quality)
+- 禁止阻塞主线程的长任务 → 必须放 QThread/Signal
+- 禁止吞掉 OCR 错误 → 必须 try/except 记录到日志
+- 禁止在 OCR 链路里调网络 API → OCR 是离线识别
+- 禁止 import 整个 core.* → 只 import 同层 (recognizers) 模块
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.3。
 """
 
 import time

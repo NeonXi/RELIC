@@ -1,15 +1,18 @@
 """
-OCR 文字纠错模块
+[L-Recognizer] text_corrector — OCR 文字纠错模块
 
-职责：
+依赖: 无(纯函数)
+被谁用: core.recognizers.item_name / core.recognizers.relic_name / core.recognizers.mod_name
+
+职责:
   - 过滤 OCR 噪声字符
-  - 字符混淆映射纠正（数字/字母形近字）
+  - 字符混淆映射纠正(数字/字母形近字)
   - 物品名提取与清洗
   - Warframe 专有名词纠错
 
-设计原则：
-  - 核心逻辑移植自 OCR_移植技术文档 4.7 节
-  - 扩展项目已有的 OCR 纠错经验（item_name.py 的混淆映射）
+设计原则:
+  - 核心逻辑移植自 OCR 移植技术文档 4.7 节
+  - 扩展项目已有的 OCR 纠错经验(item_name.py 的混淆映射)
   - 提供可配置的纠错策略
 
 用法:
@@ -17,6 +20,22 @@ OCR 文字纠错模块
     corrector = TextCorrector()
     clean_text = corrector.correct(raw_ocr_text)
     item_name = corrector.extract_item_name(ocr_result)
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L-Recognizer] (core/recognizers/)
+允许依赖:  numpy, onnxruntime, opencv-python, sqlite3, rapidocr-onnxruntime
+禁止依赖:  core.widgets/* / core.pages/* / core.state/*
+           (不能调 UI,只能输出结构化结果)
+必读规范:  .trae/rules/开发规范.md §6.3
+
+本文件相关红线:
+- 禁止返回 Qt 控件 → 只能返回 dict(含 en_name / zh_name / slug / quality)
+- 禁止阻塞主线程的长任务 → 必须放 QThread/Signal
+- 禁止吞掉 OCR 错误 → 必须 try/except 记录到日志
+- 禁止在 OCR 链路里调网络 API → OCR 是离线识别
+- 禁止 import 整个 core.* → 只 import 同层 (recognizers) 模块
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.3。
 """
 
 import re

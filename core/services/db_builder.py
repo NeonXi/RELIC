@@ -12,16 +12,30 @@
   - external/warframe-i18n_sparse/dict.zh.json          → 游戏术语中文
 
 输出: data/warframe.db
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L-Service] (core/services/)
+允许依赖:  Python 标准库 + data/* + core.hotkey_config 等纯模块
+禁止依赖:  PySide6 / QtWidgets / QtGui / QtCore(Signal 除外)
+           core.widgets/* / core.pages/* / core.recognizers/*
+必读规范:  .trae/rules/开发规范.md §6.2
+
+本文件相关红线:
+- 禁止 import PySide6 → Service 是纯逻辑,不能碰 UI
+- 禁止返回 Qt 对象 → 只能返回 dict / list / str / int / bool
+- 禁止在 Service 中发信号调用 widget → 状态走 core.state / EventBus
+- 禁止未捕获的 IO/网络异常冒泡 → 必须 try/except 降级
+- 禁止在 Service 中持有 widget 引用
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.2。
 """
 
 import json
-import re
 import sqlite3
 import shutil
 import time
 import urllib.request
 import urllib.error
-from pathlib import Path
 from typing import Optional, Callable
 
 try:
@@ -33,15 +47,18 @@ except ImportError:
     Style = None
 
 # ============================================================
-# 路径常量
+# 路径常量(打包/开发环境自适应,见 core.paths)
+#   DATA_DIR    → 用户数据目录(db 输出位置,首启复制初始库)
+#   EXTERNAL_DIR→ exe旁/项目根 external(仓库克隆位置)
 # ============================================================
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DATA_DIR = _PROJECT_ROOT / "data"
-EXTERNAL_DIR = _PROJECT_ROOT / "external"
+from core.paths import app_root as _app_root, user_data_dir as _user_data_dir
+DATA_DIR = _user_data_dir()
+EXTERNAL_DIR = _app_root() / "external"
 
 ALL_JSON = EXTERNAL_DIR / "warframe-items_sparse" / "data" / "json" / "All.json"
 I18N_JSON = EXTERNAL_DIR / "warframe-items_sparse" / "data" / "json" / "i18n.json"
 DROP_DATA_JSON = EXTERNAL_DIR / "warframe-drop-data_sparse" / "data" / "all.json"
+RELICS_JSON = EXTERNAL_DIR / "warframe-items_sparse" / "data" / "json" / "Relics.json"
 DICT_EN_JSON = EXTERNAL_DIR / "warframe-i18n_sparse" / "dict.en.json"
 DICT_ZH_JSON = EXTERNAL_DIR / "warframe-i18n_sparse" / "dict.zh.json"
 
@@ -373,6 +390,21 @@ CREATE INDEX IF NOT EXISTS idx_mktitems_en ON market_items(en_name);
 CREATE INDEX IF NOT EXISTS idx_mktitems_zh ON market_items(zh_name);
 CREATE INDEX IF NOT EXISTS idx_mktitems_unique ON market_items(item_unique);
 
+CREATE TABLE IF NOT EXISTS prime_parts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    en_name         TEXT NOT NULL UNIQUE,
+    unique_name     TEXT DEFAULT '',
+    slug            TEXT DEFAULT '',
+    zh_name         TEXT DEFAULT '',
+    part_type       TEXT DEFAULT '',
+    parent_en       TEXT DEFAULT '',
+    parent_unique   TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_pp_slug ON prime_parts(slug);
+CREATE INDEX IF NOT EXISTS idx_pp_zh ON prime_parts(zh_name);
+CREATE INDEX IF NOT EXISTS idx_pp_parent ON prime_parts(parent_en);
+CREATE INDEX IF NOT EXISTS idx_pp_part_type ON prime_parts(part_type);
+
 CREATE TABLE IF NOT EXISTS db_meta (
     key             TEXT PRIMARY KEY,
     value           TEXT NOT NULL
@@ -446,6 +478,237 @@ def _build_name_map(items_data: list) -> dict:
         if name and unique and name not in name_map:
             name_map[name] = unique
     return name_map
+
+
+def _build_prime_parts(cur, conn, all_items: list, i18n_data: dict):
+    """
+    构建 prime_parts 表 —— 遗物内含 Prime 部件专用表。
+
+    数据源：
+      - Relics.json → en_name, slug (warframeMarket.urlName)
+      - All.json components → unique_name (合法物品ID), parent_en
+      - i18n.json → parent 中文翻译
+      - 部件中文名映射表 → part_type 的中文
+
+    纯确定性逻辑，零模糊匹配。
+    """
+
+    # ---- 1. 部件类型中文名映射（游戏官方汉化，硬编码常量） ----
+    _PART_ZH_MAP = {
+        'Blueprint': '蓝图',
+        'Barrel': '枪管',
+        'Receiver': '枪机',
+        'Stock': '枪托',
+        'Grip': '握把',
+        'Handle': '握柄',
+        'Head': '锤头',
+        'Blade': '刀刃',
+        'Link': '连接器',
+        'Chassis': '机体',
+        'Neuroptics': '头部神经光元',
+        'Systems': '系统',
+        'Shell': '外壳',
+        'Cabinet': '内核',
+        'Harness': '背饰',
+        'Collar': '项圈',
+        'Brain': '大脑',
+        'Carapace': '甲壳',
+        # 稀有武器/守护部件
+        'Gauntlet': '拳套',
+        'Cerebrum': '头部',
+        'Lower Limb': '下弓臂',
+        'Upper Limb': '上弓臂',
+        'String': '弓弦',
+        'Hilt': '握柄',
+        'Guard': '护手',
+        'Blades': '爪刃',
+        'Boot': '靴子',
+        'Chain': '链条',
+        'Disc': '圆盘',
+        'Ornament': '饰物',
+        'Pouch': '镖袋',
+        'Stars': '星镖',
+        'Wings': '机翼',
+        'Buckle': '项圈扣',
+        'Band': '项圈带',
+    }
+
+    # ---- 2. 从 All.json 构建：en_name → unique_name + parent 映射 ----
+    # 遍历所有物品的 components 字段，提取 Blueprint/部件的合法 unique_name
+    _comp_map = {}  # "{parent} {component}" -> (unique_name, parent_en)
+    for item in all_items:
+        parent_name = item.get('name', '')
+        parent_uniq = item.get('uniqueName', '')
+        for comp in item.get('components', []):
+            comp_name = comp.get('name', '')
+            comp_uniq = comp.get('uniqueName', '')
+            if not comp_name or not comp_uniq:
+                continue
+            full_name = f"{parent_name} {comp_name}"
+            if full_name not in _comp_map:
+                _comp_map[full_name] = (comp_uniq, parent_name)
+            # ★ 短名索引：处理 component.name 自带完整前缀的情况
+            # 如 All.json 中 "Kavasa Prime Band" 是 "Kavasa Prime Kubrow Collar" 的
+            # component，名字已经带前缀；Relics.json 中也用短名。建立短名映射
+            # 仅在短名不在 _comp_map 中时（避免覆盖"Ash Prime Blueprint"等正常匹配）
+            if comp_name not in _comp_map and comp_name != full_name:
+                _comp_map[comp_name] = (comp_uniq, parent_name)
+
+    # ---- 3. 从 i18n.json 构建：parent unique_name → 中文名 ----
+    # i18n_data 结构: {unique_name: {lang: {name, description}, ...}}
+    _parent_zh = {}  # parent_unique_name -> zh_name(纯字符串)
+    for uniq, trans in i18n_data.items():
+        if not isinstance(trans, dict):
+            continue
+        zh_dict = trans.get('zh') or trans.get('tc')
+        if isinstance(zh_dict, dict):
+            zh_name = zh_dict.get('name', '')
+            if zh_name:
+                _parent_zh[uniq] = zh_name
+
+    # 也从 all_items 中已知的 name 做反向映射（有些父物品在 items 表中）
+    # _name_to_zh: 暂不需要，zh_name 通过 parent_unique → _parent_zh 直接查
+
+    # ---- 4. 加载 Relics.json，收集所有遗物奖励物品 ----
+    with open(RELICS_JSON, 'r', encoding='utf-8') as f:
+        relics_data = json.load(f)
+
+    # 收集唯一物品信息
+    _relic_items = {}  # en_name -> {slug, rarity}
+    for relic in relics_data:
+        for rw in relic.get('rewards', []):
+            item_obj = rw.get('item', {})
+            name = item_obj.get('name', '')
+            if not name:
+                continue
+            wm = item_obj.get('warframeMarket', {})
+            slug = wm.get('urlName') or ''
+            if name not in _relic_items:
+                _relic_items[name] = {'slug': slug}
+
+    # ---- 5. 判定 part_type（确定性：从名称尾部匹配已知部件词） ----
+    def _detect_part_type(en_name: str) -> str:
+        """从英文名末尾提取部件类型。"""
+        for pt in sorted(_PART_ZH_MAP.keys(), key=len, reverse=True):
+            if en_name.endswith(pt):
+                return pt
+        return ''
+
+    # ---- 6. 组装数据并写入 prime_parts 表 ----
+    cur.execute("DELETE FROM prime_parts")  # 每次重建全量刷新
+    pp_rows = []
+    # ★ parent 别名映射表：当 i18n 中文不符合期望时，用更短的概念。
+    # 例如 "Kavasa Prime Kubrow Collar" 在游戏中就是"喀婆萨 Prime 项圈"，
+    # 截图里出现的就是"喀婆萨 Prime 项圈带"，不应带"库狛"前缀。
+    _PARENT_ZH_OVERRIDE = {
+        'Kavasa Prime Kubrow Collar': '喀婆萨 Prime',  # 简化掉"项圈"，截图里就是"喀婆萨 Prime 项圈带"
+    }
+    for en_name in sorted(_relic_items.keys()):
+        slug = _relic_items[en_name]['slug']
+        part_type = _detect_part_type(en_name)
+
+        # 从 All.json components 查 unique_name 和 parent
+        comp_info = _comp_map.get(en_name, ('', ''))
+        unique_name = comp_info[0]
+        parent_en = comp_info[1]
+
+        # ★ 拆分匹配：处理多部件名（如 "Ash Prime Chassis Blueprint"、
+        # "Odonata Prime Wings Blueprint"）
+        # Relics.json 的战甲/Archwing 掉落名常把多个部件词组合在一起，
+        # 而 All.json components 是单层扁平结构，需要逐层剥开分别匹配
+        if not unique_name and part_type and parent_en == '':
+            # 从外到内逐层剥掉 part_type 和内层部件词
+            remaining = en_name[:-(len(part_type))].rstrip()
+            found_parts = [part_type]
+            # 循环剥离内层部件词，直到剩余不是已知名部件
+            while True:
+                stripped = False
+                for pt_inner in sorted(_PART_ZH_MAP.keys(), key=len, reverse=True):
+                    if remaining.endswith(pt_inner) and pt_inner not in found_parts:
+                        remaining = remaining[:-(len(pt_inner))].rstrip()
+                        found_parts.append(pt_inner)
+                        stripped = True
+                        break
+                if not stripped:
+                    break
+            candidate_parent = remaining
+            if candidate_parent and any(i.get('name') == candidate_parent for i in all_items):
+                # 用拆出的每个部件分别查 components，优先取 Blueprint 类
+                for try_part in sorted(found_parts, key=lambda p: 0 if p == 'Blueprint' else 1):
+                    full_key = f"{candidate_parent} {try_part}"
+                    if full_key in _comp_map:
+                        unique_name = _comp_map[full_key][0]
+                        parent_en = candidate_parent
+                        break
+                # ★ 记录拆分出的内层部件词（用于生成完整 zh_name）
+                # found_parts 已包含 Blueprint 和内层部件词
+                # 把内层部件词存到 comp_info 的第三个元素
+                # （前面 comp_info 是个元组，这里需要扩展）
+                if unique_name and len(found_parts) > 1:
+                    # 把内层部件词拼到 part_type 后，part_type 形如 "Chassis Blueprint"
+                    # 但 Blueprint 已被 Blueprint 表达，所以 part_type 存内层部件词
+                    inner_parts = [p for p in found_parts if p != 'Blueprint']
+                    if inner_parts:
+                        part_type = inner_parts[0]  # 战甲通常是单个内层部件
+
+        # 查 parent 的 unique_name（用于查 i18n）
+        parent_unique = ''
+        for item in all_items:
+            if item.get('name') == parent_en:
+                parent_unique = item.get('uniqueName', '')
+                break
+
+        # 组合 zh_name: parent中文 + "Prime" + 部件中文
+        zh_name = ''
+        # ★ 优先用别名覆盖（处理 i18n 翻译冗长的情况）
+        if parent_en in _PARENT_ZH_OVERRIDE:
+            base_zh_full = _PARENT_ZH_OVERRIDE[parent_en]
+        elif parent_unique and parent_unique in _parent_zh:
+            base_zh_full = _parent_zh[parent_unique]
+        else:
+            base_zh_full = ''
+        if base_zh_full:
+            # 去重：把末尾所有连续的 "Prime"（可能多个）全部去掉
+            import re as _re
+            base_zh = _re.sub(r'\s*Prime\s*$', '', base_zh_full).rstrip()
+            part_zh = _PART_ZH_MAP.get(part_type, '')
+            # 判断 en_name 末尾是否含 Blueprint（决定是否追加"蓝图"）
+            has_blueprint = en_name.endswith('Blueprint')
+            if base_zh and part_zh:
+                # 如果 base_zh 已含 "Prime"，不再额外添加
+                if 'Prime' in base_zh:
+                    zh_name = f"{base_zh} {part_zh}"
+                else:
+                    zh_name = f"{base_zh} Prime {part_zh}"
+                # 蓝图后缀补齐（战甲/Archwing 蓝图）
+                if has_blueprint and '蓝图' not in zh_name:
+                    zh_name = f"{zh_name} 蓝图"
+
+        pp_rows.append((en_name, unique_name, slug, zh_name, part_type, parent_en, parent_unique))
+
+    cur.executemany(
+        "INSERT INTO prime_parts "
+        "(en_name, unique_name, slug, zh_name, part_type, parent_en, parent_unique) "
+        "VALUES (?,?,?,?,?,?,?)",
+        pp_rows
+    )
+    conn.commit()
+
+    # 统计日志
+    total = len(pp_rows)
+    has_slug = sum(1 for r in pp_rows if r[2])
+    has_zh = sum(1 for r in pp_rows if r[3])
+    has_unique = sum(1 for r in pp_rows if r[1])
+    has_part = sum(1 for r in pp_rows if r[4])
+
+    # 返回统计供调用方打印（避免在辅助函数中引入日志依赖）
+    return {
+        'total': total,
+        'has_slug': has_slug,
+        'has_zh': has_zh,
+        'has_unique': has_unique,
+        'has_part': has_part,
+    }
 
 
 # ============================================================
@@ -670,26 +933,74 @@ def build(
         with open(DROP_DATA_JSON, 'r', encoding='utf-8') as f:
             drop_data = json.load(f)
 
-        # 3a: relics
+        # 3a: relics — 优先使用 Relics.json（含 uniqueName + warframeMarket.urlName）
         relic_rows = []
         reward_rows = []
         relic_id_map = {}
 
-        for relic in drop_data.get('relics', []):
-            tier = relic.get('tier', '')
-            rname = relic.get('relicName', '')
-            state = relic.get('state', '')
-            did = relic.get('_id', '')
-            vaulted = relic_vaulted_map.get((tier, rname), 0)
-            cur.execute("INSERT OR IGNORE INTO relics (tier, relic_name, state, vaulted, drop_data_id) VALUES (?,?,?,?,?)",
-                        (tier, rname, state, vaulted, did))
-            row = cur.execute("SELECT id FROM relics WHERE tier=? AND relic_name=? AND state=?", (tier, rname, state)).fetchone()
-            if row:
+        # ★ 优先从 Relics.json 构建（数据更丰富：含 item_unique + wm_url_name）
+        if RELICS_JSON.exists():
+            with open(RELICS_JSON, 'r', encoding='utf-8') as f:
+                relics_data = json.load(f)
+            _log(f"  使用 Relics.json: {len(relics_data)} 条遗物")
+
+            for relic in relics_data:
+                tier = ''
+                rname = ''
+                state = ''
+                # 解析遗物名: "Axi A1 Intact" → tier="Axi", name="A1", state="Intact"
+                parts = relic.get('name', '').rsplit(' ', 2)
+                if len(parts) >= 3:
+                    tier, rname, state = parts[0], parts[1], parts[2]
+                elif len(parts) == 2:
+                    tier, rname = parts[0], parts[1]
+                else:
+                    continue
+
+                vaulted = 1 if relic.get('vaulted') else 0
+                did = relic.get('uniqueName', '')
+                cur.execute("INSERT OR IGNORE INTO relics (tier, relic_name, state, vaulted, drop_data_id) VALUES (?,?,?,?,?)",
+                            (tier, rname, state, vaulted, did))
+                row = cur.execute("SELECT id FROM relics WHERE tier=? AND relic_name=? AND state=?", (tier, rname, state)).fetchone()
+                if not row:
+                    continue
                 relic_id = row[0]
                 relic_id_map[(tier, rname, state)] = relic_id
+
                 for rw in relic.get('rewards', []):
-                    reward_rows.append((relic_id, rw.get('itemName', ''), name_map.get(rw.get('itemName', ''), ''),
-                        rw.get('rarity', ''), rw.get('chance', 0), rw.get('_id', ''), ''))
+                    item_data = rw.get('item', {})
+                    wm_info = item_data.get('warframeMarket', {})
+                    reward_rows.append((
+                        relic_id,
+                        item_data.get('name', ''),           # item_name
+                        item_data.get('uniqueName', ''),     # item_unique ★ 填充
+                        rw.get('rarity', ''),
+                        rw.get('chance', 0),
+                        did,                                  # drop_data_id
+                        wm_info.get('urlName', '')           # wm_url_name ★ 填充
+                    ))
+            _log(f"  Relics.json: {len(relic_id_map)} 遗物, {len(reward_rows)} 奖励")
+        elif DROP_DATA_JSON.exists():
+            # 回退: 使用 drop-data all.json（字段较少，item_unique/wm_url_name 为空）
+            _log("  [!] Relics.json 不存在，回退到 drop-data all.json（字段不完整）")
+            with open(DROP_DATA_JSON, 'r', encoding='utf-8') as f:
+                drop_data = json.load(f)
+
+            for relic in drop_data.get('relics', []):
+                tier = relic.get('tier', '')
+                rname = relic.get('relicName', '')
+                state = relic.get('state', '')
+                did = relic.get('_id', '')
+                vaulted = relic_vaulted_map.get((tier, rname), 0)
+                cur.execute("INSERT OR IGNORE INTO relics (tier, relic_name, state, vaulted, drop_data_id) VALUES (?,?,?,?,?)",
+                            (tier, rname, state, vaulted, did))
+                row = cur.execute("SELECT id FROM relics WHERE tier=? AND relic_name=? AND state=?", (tier, rname, state)).fetchone()
+                if row:
+                    relic_id = row[0]
+                    relic_id_map[(tier, rname, state)] = relic_id
+                    for rw in relic.get('rewards', []):
+                        reward_rows.append((relic_id, rw.get('itemName', ''), name_map.get(rw.get('itemName', ''), ''),
+                            rw.get('rarity', ''), rw.get('chance', 0), rw.get('_id', ''), ''))
 
         cur.executemany("""INSERT OR IGNORE INTO relic_rewards
             (relic_id, item_name, item_unique, rarity, chance, drop_data_id, wm_url_name)
@@ -697,6 +1008,51 @@ def build(
         conn.commit()
         stats['relics'] = len(relic_id_map)
         stats['relic_rewards'] = len(reward_rows)
+
+        # ★ 3a-补: 跨表关联填充残留空值
+        _log("  跨表填充: 补全 item_unique / wm_url_name ...")
+        # 用 items 表的 name → unique_name 回填 relic_rewards.item_unique
+        filled_unique = cur.execute("""
+            UPDATE relic_rewards SET item_unique = (
+                SELECT i.unique_name FROM items i
+                WHERE i.name = relic_rewards.item_name
+                  AND i.unique_name IS NOT NULL AND i.unique_name != ''
+            ) WHERE (item_unique IS NULL OR item_unique = '')
+              AND EXISTS (
+                  SELECT 1 FROM items i WHERE i.name = relic_rewards.item_name
+                    AND i.unique_name IS NOT NULL AND i.unique_name != ''
+              )
+        """).rowcount
+
+        # 用 market_items 的 slug 回填 relic_rewards.wm_url_name（通过 item_unique 关联）
+        filled_wm = cur.execute("""
+            UPDATE relic_rewards SET wm_url_name = (
+                SELECT mi.slug FROM market_items mi
+                WHERE mi.item_unique = relic_rewards.item_unique
+                  AND mi.slug IS NOT NULL AND mi.slug != ''
+            ) WHERE (wm_url_name IS NULL OR wm_url_name = '')
+              AND (item_unique IS NOT NULL AND item_unique != '')
+              AND EXISTS (
+                  SELECT 1 FROM market_items mi WHERE mi.item_unique = relic_rewards.item_unique
+                    AND mi.slug IS NOT NULL AND mi.slug != ''
+              )
+        """).rowcount
+
+        # 二次回填：用 items.name 匹配 market_items.en_name，再填 wm_url_name
+        filled_wm2 = cur.execute("""
+            UPDATE relic_rewards SET wm_url_name = (
+                SELECT mi.slug FROM market_items mi
+                WHERE mi.en_name = relic_rewards.item_name
+                  AND mi.slug IS NOT NULL AND mi.slug != ''
+            ) WHERE (wm_url_name IS NULL OR wm_url_name = '')
+              AND EXISTS (
+                  SELECT 1 FROM market_items mi WHERE mi.en_name = relic_rewards.item_name
+                    AND mi.slug IS NOT NULL AND mi.slug != ''
+              )
+        """).rowcount
+
+        conn.commit()
+        _log(f"  跨表填充: item_unique +{filled_unique}, wm_url_name(关联) +{filled_wm}, wm_url_name(名称) +{filled_wm2}")
 
         # 3b: missionRewards
         planet_rows = []; node_rows = []; mreward_rows = []
@@ -875,7 +1231,93 @@ def build(
         stats['syndicate_rewards'] = len(synd_rows)
 
         conn.commit()
-        _log(f"  relics={stats.get('relics',0)}, rewards={stats.get('relic_rewards',0)}")
+        _log(f"  relics={stats.get('relics',0)}, rewards={stats.get('relics',0)}")
+
+        # ================================================================
+        # ★ 3b: 构建 prime_parts 表（遗物内含 Prime 部件专用表）
+        # ================================================================
+        _log("[3b/6] 构建 prime_parts 表...")
+        if RELICS_JSON.exists():
+            pp_stats = _build_prime_parts(cur, conn, all_items, i18n_data)
+            pp_count = cur.execute("SELECT COUNT(*) FROM prime_parts").fetchone()[0]
+            stats['prime_parts'] = pp_count
+            _log(f"  prime_parts={pp_count} (slug={pp_stats.get('has_slug',0)}, zh={pp_stats.get('has_zh',0)}, unique={pp_stats.get('has_unique',0)}, part_type={pp_stats.get('has_part',0)})")
+        else:
+            _log("  [!] Relics.json 不存在，跳过 prime_parts")
+
+        # ★ 3c-补: 多跳精确匹配填充 —— 纯字符串相等，零模糊匹配
+        #
+        # 核心思路：从所有"已确认"的来源收集 name→unique_name 映射，
+        # 构建一个全局名称解析表。然后对空值字段做精确查找。
+        # 多跳体现在：不同表的同一物品可能有不同名称写法（如英文/中文/编号），
+        # 只要任一表中该名称已有唯一标识，其他表的同名条目就能通过精确匹配关联上。
+        #
+        # 数据源层级（仅使用权威锚点，避免循环引用/数据污染）：
+        #   Layer 0: items 表          — name(英) → unique_name    （权威锚点）
+        #   Layer 1: item_translations — name(多语言) → unique_name （i18n 别名，外键校验）
+        #   注意：不使用 rewards 表作为别名源！因为 relic_rewards 等表的
+        #         unique 字段可能存的是非物品ID（如遗物自身ID），会导致错误关联。
+
+        _log("  跨表填充: 构建多跳名称解析图...")
+
+        # ---- Layer 0: items 表（权威锚点）----
+        _name_to_unique = dict(cur.execute(
+            "SELECT name, unique_name FROM items WHERE unique_name IS NOT NULL AND unique_name != ''"
+        ).fetchall())
+        _log(f"    Layer0 items: {len(_name_to_unique)} 条")
+
+        # ---- Layer 1: item_translations（多语言别名，经外键校验）----
+        # 仅采用 unique_name 存在于 items 表中的条目，过滤孤立/错误数据
+        _i18n_count = cur.execute("SELECT COUNT(*) FROM item_translations").fetchone()[0]
+        if _i18n_count > 0:
+            _i18n_rows = cur.execute(
+                "SELECT it.name, it.unique_name FROM item_translations it "
+                "INNER JOIN items i ON i.unique_name = it.unique_name "
+                "WHERE it.unique_name IS NOT NULL AND it.unique_name != '' "
+                "AND it.name IS NOT NULL AND it.name != ''"
+            ).fetchall()
+            _new_aliases = 0
+            for _name, _unique in _i18n_rows:
+                if _name not in _name_to_unique:
+                    _name_to_unique[_name] = _unique
+                    _new_aliases += 1
+            _log(f"    Layer1 i18n(已校验): +{_new_aliases} 条新别名 (共{len(_i18n_rows)}条)")
+
+        _log(f"    解析图总容量: {len(_name_to_unique)} 个名称 → unique_name")
+
+        # ---- 执行填充：对每个目标表，精确查找后批量 UPDATE ----
+        _FILL_TARGETS = [
+            ('mission_rewards',    'item_name',       'item_unique'),
+            ('sortie_rewards',     'item_name',       'item_unique'),
+            ('bounty_rewards',     'item_name',       'item_unique'),
+            ('transient_rewards',  'item_name',       'item_unique'),
+            ('syndicate_rewards',  'item_name',       'item_unique'),
+            ('key_rewards',        'item_name',       'item_unique'),
+            ('mod_drops',          'mod_name',        'mod_unique'),
+            ('enemy_mod_tables',   'mod_name',        'mod_unique'),
+            ('blueprint_drops',    'blueprint_name',  'blueprint_unique'),
+            ('enemy_bp_tables',    'blueprint_name',  'blueprint_unique'),
+        ]
+
+        total_filled = 0
+        for ti, (table, name_col, unique_col) in enumerate(_FILL_TARGETS):
+            cur.execute(f"SELECT id, [{name_col}] FROM [{table}] WHERE ([{unique_col}] IS NULL OR [{unique_col}] = '')")
+            empty_rows = cur.fetchall()
+
+            batch_updates = []
+            for row_id, raw_name in empty_rows:
+                # 纯精确匹配：原始名称直接查解析图
+                if raw_name in _name_to_unique:
+                    batch_updates.append((_name_to_unique[raw_name], row_id))
+
+            if batch_updates:
+                cur.executemany(
+                    f"UPDATE [{table}] SET [{unique_col}]=? WHERE id=?", batch_updates)
+                total_filled += len(batch_updates)
+                _log(f"    [{ti+1}/{len(_FILL_TARGETS)}] {table}.{unique_col}: +{len(batch_updates)}")
+
+        conn.commit()
+        _log(f"  跨表填充完成: 纯精确匹配补全 {total_filled} 条")
     else:
         _log(f"  [!] all.json 不存在: {DROP_DATA_JSON}")
 

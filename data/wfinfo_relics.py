@@ -407,30 +407,38 @@ class RelicDB:
                                 gt_map: dict) -> str:
         """用预加载的字典翻译部件名（无 SQL 查询）。
 
-        翻译优先级：
-          1. unique_name → items.zh_name
-          2. item_name  → items.zh_name
-          3. item_name  → game_translations.zh
-          4. 剥离 Prime 部件后缀 → 基础名翻译 + 中文后缀拼接
-        """
-        # 1. 优先用 unique_name 精确匹配
-        if unique_name and unique_name in zh_by_unique:
-            return zh_by_unique[unique_name]
+        翻译优先级（调整后）：
+          1. item_name  → items.zh_name          （英文名精确匹配）
+          2. item_name  → game_translations.zh   （最完整的翻译源）
+          3. 剥离 Prime 部件后缀 → 基础名翻译 + 中文后缀拼接
+          4. unique_name → items.zh_name          （兜底，需过滤遗物名）
+          5. 返回 en_name                        （原文兜底）
 
-        # 2. 用英文 item_name 匹配
+        ★ 调整原因：relic_rewards.item_unique 存的是遗物投影路径而非部件唯一名，
+           items 表用此值查到的是遗物中文名（如"中纪 K9 遗物"），导致全部部件显示错误。
+        """
+        # 1. 用英文 item_name 匹配 items 表
         if en_name and en_name in zh_by_name:
             return zh_by_name[en_name]
 
-        # 3. 从 game_translations 查
+        # 2. 从 game_translations 查（数据最全）
         if en_name and en_name in gt_map:
             return gt_map[en_name]
 
-        # 4. Prime 部件后缀剥离：处理 "Kompressa Prime Barrel" 这类复合名
+        # 3. Prime 部件后缀剥离：处理 "Kompressa Prime Barrel" 这类复合名
         if en_name:
             result = cls._try_prime_part_fallback(en_name, zh_by_name, gt_map)
             if result:
                 return result
 
+        # 4. 兜底：unique_name 精确匹配，但过滤掉明显是遗物名的结果
+        if unique_name and unique_name in zh_by_unique:
+            candidate = zh_by_unique[unique_name]
+            # 过滤：如果结果包含"遗物"/"纪元"等遗物特征词，说明 unique_name 数据有误，跳过
+            if not any(kw in candidate for kw in ('遗物', '纪', 'Relic', 'Lith', 'Meso', 'Neo', 'Axi')):
+                return candidate
+
+        # 5. 最终兜底：返回英文名
         return en_name
 
     @classmethod

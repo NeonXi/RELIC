@@ -12,19 +12,36 @@
     worker.progress_pct.connect(...)
     worker.finished.connect(...)
     threading.Thread(target=worker.run, daemon=True).start()
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L-Service] (core/services/)
+允许依赖:  Python 标准库 + data/* + core.hotkey_config 等纯模块
+禁止依赖:  PySide6 / QtWidgets / QtGui / QtCore(Signal 除外)
+           core.widgets/* / core.pages/* / core.recognizers/*
+必读规范:  .trae/rules/开发规范.md §6.2
+
+本文件相关红线:
+- 禁止 import PySide6 → Service 是纯逻辑,不能碰 UI
+- 禁止返回 Qt 对象 → 只能返回 dict / list / str / int / bool
+- 禁止在 Service 中发信号调用 widget → 状态走 core.state / EventBus
+- 禁止未捕获的 IO/网络异常冒泡 → 必须 try/except 降级
+- 禁止在 Service 中持有 widget 引用
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.2。
 """
 
 import sys
 import time
-from pathlib import Path
+import traceback
 
 from core.services._event_emitter import EventEmitter
 
 # ============================================================
 # 路径常量
 # ============================================================
-DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
-WARFRAME_DB_PATH = DATA_DIR / "warframe.db"
+# 路径常量(打包/开发环境自适应,见 core.paths)
+from core.paths import app_root as _app_root, ensure_user_file as _ensure_db_file
+WARFRAME_DB_PATH = _ensure_db_file("warframe.db")
 
 
 class DataPipelineWorker:
@@ -56,26 +73,32 @@ class DataPipelineWorker:
         self.error = EventEmitter()
 
     def cancel(self):
+        """请求 Pipeline 取消:worker 线程在下一轮询发现 _cancelled 后退出。"""
         self._cancelled = True
 
     def _emit_log(self, level: str, msg: str):
+        """发射日志信号到 UI 日志面板（统一日志出口，不再散落 print）。
+
+        Args:
+            level: 日志级别 ("info" / "error" / "warning")
+            msg: 日志消息
+        """
         if not self._cancelled:
-            print(f"[PIPELINE] [{level.upper()}] {msg}")
             self.log.emit(level, msg)
 
     def _emit_step(self, step: int, desc: str):
+        """发射步骤变更信号（用于更新 UI 进度显示）。"""
         if not self._cancelled:
-            print(f"[PIPELINE] [STEP {step}] {desc}")
             self.step_changed.emit(step, desc)
 
     def _emit_progress(self, pct: int):
+        """发射整体进度信号。"""
         if not self._cancelled:
-            print(f"[PIPELINE] [PROGRESS] {pct}%")
             self.progress_pct.emit(pct)
 
     def _step_progress(self, stage: str, cur: int, total: int):
+        """发射分步骤进度信号（如 git clone 的文件数）。"""
         if not self._cancelled:
-            print(f"[PIPELINE] [DETAIL] {stage}: {cur}/{total}")
             self.progress_detail.emit(stage, cur, total)
 
     def run(self):
@@ -162,11 +185,12 @@ class DataPipelineWorker:
             self.finished.emit(results)
 
         except Exception as e:
+            tb = traceback.format_exc()
+            # 通过统一日志通道输出（UI 日志面板 + 控制台）
             self._emit_log("error", f"流水线执行失败: {e}")
-            import traceback
-            self._emit_log("error", traceback.format_exc())
+            self._emit_log("error", tb)
             results["success"] = False
-            results["error"] = str(e)
+            results["error"] = f"{e}\n\n{tb}"
             self.error.emit(str(e))
             self.finished.emit(results)
 
@@ -199,7 +223,7 @@ class DataPipelineWorker:
                     stage, cur, total = args
                     self.progress_detail.emit(stage, cur, total)
 
-            external_dir = DATA_DIR.parent / "external"
+            external_dir = _app_root() / "external"
             sparse_repos = [
                 ("warframe-items", "遗物/物品", "warframe-items_sparse",
                  ["Relics.json", "i18n.json", "All.json"],
@@ -222,7 +246,7 @@ class DataPipelineWorker:
                            init_fn, update_fn) in enumerate(sparse_repos):
                 self._emit_log("info", f"")
                 self._emit_log("info", f"--- {repo_name}: {repo_dir_name} ---")
-                repo_dir = Path(__file__).resolve().parent.parent.parent / "external" / repo_dir_name
+                repo_dir = _app_root() / "external" / repo_dir_name
 
                 self.repo_progress.emit(repo_name, 0, "准备中...")
 
@@ -304,9 +328,10 @@ class DataPipelineWorker:
             return all_ok
 
         except Exception as e:
+            tb = traceback.format_exc()
+            # 通过统一日志通道输出（UI 日志面板 + 控制台）
             self._emit_log("error", f"拉取源数据失败: {e}")
-            import traceback
-            self._emit_log("error", traceback.format_exc())
+            self._emit_log("error", tb)
             return False
 
     def _run_step_build_db(self, pct_start: int, pct_end: int) -> dict:
@@ -366,7 +391,7 @@ class DataPipelineWorker:
 
 def get_pipeline_summary() -> dict:
     """获取当前数据文件状态的概要信息。"""
-    external_dir = DATA_DIR.parent / "external"
+    external_dir = _app_root() / "external"
     wfcd_dir = external_dir / "warframe-items_sparse" / "data" / "json"
     drop_dir = external_dir / "warframe-drop-data_sparse" / "data"
     i18n_dir = external_dir / "warframe-i18n_sparse"

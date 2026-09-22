@@ -1,5 +1,4 @@
 {
   "check_status": true,
-  "query_parts": true,
-  "translate": false
+  "query_parts": true
 }

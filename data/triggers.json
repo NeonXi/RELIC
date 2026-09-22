@@ -43,5 +43,35 @@
         "value": "4"
       }
     ]
+  },
+  {
+    "name": "锁诺拉",
+    "enabled": false,
+    "trigger_input": {
+      "type": "mouse",
+      "button": "right_press"
+    },
+    "delay_ms": 10,
+    "actions": [
+      {
+        "type": "mouse_move",
+        "value": "1604, 963"
+      }
+    ]
+  },
+  {
+    "name": "EY自动破解器",
+    "enabled": false,
+    "trigger_input": {
+      "type": "keyboard",
+      "key": "e"
+    },
+    "delay_ms": 10,
+    "actions": [
+      {
+        "type": "key",
+        "value": "y"
+      }
+    ]
   }
 ]

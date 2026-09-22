@@ -8,20 +8,35 @@
   - WFCD/warframe-items      → 遗物/物品数据
   - WFCD/warframe-drop-data   → 掉落数据
   - calamity-inc/warframe-public-export-plus → 翻译数据
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L-Service] (core/services/)
+允许依赖:  Python 标准库 + data/* + core.hotkey_config 等纯模块
+禁止依赖:  PySide6 / QtWidgets / QtGui / QtCore(Signal 除外)
+           core.widgets/* / core.pages/* / core.recognizers/*
+必读规范:  .trae/rules/开发规范.md §6.2
+
+本文件相关红线:
+- 禁止 import PySide6 → Service 是纯逻辑,不能碰 UI
+- 禁止返回 Qt 对象 → 只能返回 dict / list / str / int / bool
+- 禁止在 Service 中发信号调用 widget → 状态走 core.state / EventBus
+- 禁止未捕获的 IO/网络异常冒泡 → 必须 try/except 降级
+- 禁止在 Service 中持有 widget 引用
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.2。
 """
 
 import os
 import subprocess
 import shutil
 from pathlib import Path
-from typing import Optional, Callable
 
 
 # ============================================================
-# 路径常量（相对于项目根目录）
+# 路径常量(打包/开发环境自适应,见 core.paths)
 # ============================================================
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-_EXTERNAL_DIR = _PROJECT_ROOT / "external"
+from core.paths import app_root as _app_root
+_EXTERNAL_DIR = _app_root() / "external"
 
 # ── warframe-items ──
 REPO_DIR = _EXTERNAL_DIR / "warframe-items_sparse"
@@ -48,21 +63,28 @@ I18N_FILES_TO_PULL = ["dict.en.json", "dict.zh.json"]
 
 def run_cmd(cmd: list, cwd: Path = None, capture: bool = False) -> tuple:
     """
-    运行 Git 命令
+    运行 Git 命令（Windows 下隐藏 CMD 窗口）
     :param cmd: 命令列表
     :param cwd: 工作目录
     :param capture: 是否捕获输出
     :return: (返回码, 标准输出, 标准错误)
     """
     try:
-        result = subprocess.run(
-            cmd,
+        kwargs = dict(
             cwd=cwd,
             capture_output=capture,
             text=True,
             encoding="utf-8",
-            errors="replace"
+            errors="replace",
         )
+        # Windows 下隐藏 CMD 弹窗
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            kwargs["startupinfo"] = startupinfo
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        result = subprocess.run(cmd, **kwargs)
         return result.returncode, result.stdout, result.stderr
     except Exception as e:
         return -1, "", str(e)

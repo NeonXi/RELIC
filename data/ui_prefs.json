@@ -1,0 +1,17 @@
+{
+  "window_opacity": 100,
+  "background": {
+    "source": "src_1790072853184.jpg",
+    "crop": [
+      0,
+      0,
+      1667,
+      1080
+    ],
+    "opacity": 83,
+    "blur": 0,
+    "immersive": true,
+    "immersive_strength": 25,
+    "immersive_color": "black"
+  }
+}

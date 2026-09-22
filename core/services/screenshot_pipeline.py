@@ -20,6 +20,22 @@
     from core.services.screenshot_pipeline import ScreenshotPipelineService
     svc = ScreenshotPipelineService(app)
     svc.start()   # 注册热键、后台加载组件
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L-Service] (core/services/)
+允许依赖:  Python 标准库 + data/* + core.hotkey_config 等纯模块
+禁止依赖:  PySide6 / QtWidgets / QtGui / QtCore(Signal 除外)
+           core.widgets/* / core.pages/* / core.recognizers/*
+必读规范:  .trae/rules/开发规范.md §6.2
+
+本文件相关红线:
+- 禁止 import PySide6 → Service 是纯逻辑,不能碰 UI
+- 禁止返回 Qt 对象 → 只能返回 dict / list / str / int / bool
+- 禁止在 Service 中发信号调用 widget → 状态走 core.state / EventBus
+- 禁止未捕获的 IO/网络异常冒泡 → 必须 try/except 降级
+- 禁止在 Service 中持有 widget 引用
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.2。
 """
 
 from __future__ import annotations
@@ -36,9 +52,6 @@ os.environ["OMP_NUM_THREADS"] = str(_OCR_THREADS)
 os.environ["ORT_NUM_THREADS"] = str(_OCR_THREADS)
 os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
 
-import threading
-from typing import Callable, Optional
-
 from core.services._event_emitter import EventEmitter
 from core.hotkey_config import (
     load_hotkeys, DEFAULT_HOTKEYS,
@@ -47,7 +60,7 @@ from core.hotkey_config import (
 from core.constants import DXCAM_MAX_RETRIES, DXCAM_RETRY_BASE_SLEEP
 from core.hotkey_manager import HotkeyManager
 from core.mode_handlers import (
-    handle_check_status, handle_query_parts, handle_translate,
+    handle_check_status, handle_query_parts,
 )
 
 
@@ -68,9 +81,11 @@ class _OCRWorker:
         self._frame = frame.copy() if frame is not None else None
 
     def cancel(self):
+        """请求截图管线取消(设置标志位,run() 中途会检查并退出)。"""
         self._cancelled = True
 
     def run(self):
+        """截图线程主入口:抓屏 → 降采样 → 调识别器 → 写库 → emit 进度与结果。"""
         try:
             import ctypes
             k32 = ctypes.windll.kernel32
@@ -111,10 +126,15 @@ class ScreenshotPipelineService:
         self.ready_changed = EventEmitter()      # (is_ready)
         self.ocr_finished = EventEmitter()       # (ocr_type, results)
         self.eye_mask_toggled = EventEmitter()   # 护眼遮罩切换信号
+        self.bring_to_front = EventEmitter()    # 窗口置顶信号
 
         # ── UI 层 ──
         self._overlay = None
         self._overlay_ready = False
+
+        # cd_* 热键改由 LowLevelHotkeyHook 直接调 CdAssistService
+        # (不通过 pipeline 转发,避免和 hotkey_manager 的 RegisterHotKey 冲突:
+        #  RegisterHotKey 会全系统拦截裸键 1/2/3/4,导致游戏无法接收)
 
         # ── 信号桥接 ──
         self._bridge = _TriggerBridge()
@@ -134,18 +154,17 @@ class ScreenshotPipelineService:
         self._ocr_worker: Optional[_OCRWorker] = None
         self._ocr_lock = threading.Lock()
         self._pending_mode: Optional[str] = None
+        self._generation: int = 0  # ★ 代号计数器，用于忽略过期回调
 
         # ── 重型组件（延迟初始化）──
         self._camera = None
         self._relic_ocr = None
         self._item_ocr = None
-        self._price_ocr = None  # ★ PPOCRv3 价格查询专用识别器
         self._relic_db = None
 
         # ── 就绪标志 ──
         self._ocr_ready = False
         self._camera_ready = False
-        self._price_ocr_ready = False  # ★ 价格 OCR 就绪标志
         self._all_ready = False
 
         # ── 热键管理器 ──
@@ -197,6 +216,7 @@ class ScreenshotPipelineService:
 
         self._hotkey_mgr.clear()
         self._camera = None
+
         print("[Pipeline] 所有运行缓存已清理", flush=True)
 
     # ════════════════════════════════════
@@ -213,6 +233,17 @@ class ScreenshotPipelineService:
                 self._camera_ready = True
                 self._log("ok", "摄像头初始化完成")
 
+                # ★ dxcam 预热：首次 grab 可能因 DirectX 管道未稳定而失败
+                #   做一次空抓取让管道就绪，避免用户第一次截图失败
+                try:
+                    warmup = self._camera.grab(region=(0, 0, 100, 100))
+                    if warmup is not None:
+                        self._log("info", "dxcam 预热成功")
+                    else:
+                        self._log("warn", "dxcam 预热返回 None（非致命）")
+                except Exception as e:
+                    self._log("warn", f"dxcam 预热异常（非致命）: {e}")
+
                 # 2. 遗物 OCR
                 self._log("info", "正在加载遗物 OCR 模型...")
                 from core.recognizers.relic_name import RelicNameRecognizer
@@ -224,18 +255,6 @@ class ScreenshotPipelineService:
                 self._item_ocr = ItemNameRecognizer()
                 self._ocr_ready = True
                 self._log("ok", "OCR 引擎初始化完成 (遗物 + 物品)")
-
-                # 3.5 价格查询专用 OCR (PPOCRv3 ONNX)
-                self._log("info", "正在加载价格查询 OCR 模型 (PP-OCRv3)...")
-                try:
-                    from core.recognizers.ppocr_v3 import PPOCRv3Recognizer
-                    self._price_ocr = PPOCRv3Recognizer()
-                    self._price_ocr_ready = True
-                    self._log("ok", "价格 OCR 引擎初始化完成 (PP-OCRv3)")
-                except Exception as e:
-                    self._log("warn", f"价格 OCR 加载失败（CTRL+T 不可用）: {e}")
-                    self._price_ocr = None
-                    self._price_ocr_ready = False
 
                 # 4. 遗物数据库
                 self._log("info", "正在加载数据库...")
@@ -317,10 +336,16 @@ class ScreenshotPipelineService:
             return
         self._hotkey_mgr.last_action_time = now
 
-        # 护眼遮罩不依赖摄像头/OCR，直接发射信号
+        # 护眼遮罩 不依赖摄像头/OCR，直接发射信号
         if action == 'eye_mask':
             self._log("info", "护眼遮罩切换", source="_on_hotkey")
             self.eye_mask_toggled.emit()
+            return
+
+        # 窗口置顶:一次性拉到最前(不依赖摄像头/OCR)
+        if action == 'bring_to_front':
+            self._log("info", "窗口置顶", source="_on_hotkey")
+            self.bring_to_front.emit()
             return
 
         if not self._camera_ready:
@@ -341,17 +366,6 @@ class ScreenshotPipelineService:
             self._overlay._hide_mode_buttons()
             self._overlay.label.clear()
             self._do_fullscreen_screenshot()
-        elif action == 'query_price':
-            # CTRL+T 价格查询：启动框选模式
-            self._log("info", "价格查询: 启动框选", source="_on_hotkey")
-            if not self._price_ocr_ready:
-                from data.ui_strings import S
-                self._log("warn", "价格 OCR 引擎正在初始化，请稍候...", source="_on_hotkey")
-                self._overlay.display(S("overlay", "ocr_recognizing"), auto_hide_ms=2000)
-                return
-            # 启动框选，标记为价格查询模式
-            self._pending_mode = 'query_price'
-            self._overlay.start_selection()
 
     # ════════════════════════════════════
     #  框选截图
@@ -377,19 +391,19 @@ class ScreenshotPipelineService:
 
         logical = region_info['logical']
         phys = region_info['physical']
+
         frame = self._camera.grab(region=phys)
+        # ★ 首次截图重试保护（dxcam 偶发空帧）
+        if frame is None:
+            import time as _t
+            _t.sleep(0.05)
+            frame = self._camera.grab(region=phys)
         if frame is None:
             from data.ui_strings import S
             self._overlay.display(S("overlay", "screenshot_failed"), auto_hide_ms=3000)
             return
 
-        # ★ 判断是否为价格查询模式（全屏 GDI 截图 + 区域过滤）
-        if self._pending_mode == 'query_price':
-            # ★ 全屏截图在 _do_query_price 内部执行，这里只传递框选区域用于过滤
-            self._do_query_price(frame, logical)
-            self._pending_mode = None
-        else:
-            self._after_screenshot(frame, logical)
+        self._after_screenshot(frame, logical)
 
     # ════════════════════════════════════
     #  全屏截图
@@ -416,6 +430,11 @@ class ScreenshotPipelineService:
         logical = (0, 0, int(region_w / dpi), int(region_h / dpi))
 
         frame = self._camera.grab(region=phys)
+        # ★ 首次截图重试保护（dxcam 偶发空帧）
+        if frame is None:
+            import time as _t
+            _t.sleep(0.05)
+            frame = self._camera.grab(region=phys)
         if frame is None:
             from data.ui_strings import S
             self._overlay.display(S("overlay", "fullscreen_failed"), auto_hide_ms=3000)
@@ -447,7 +466,7 @@ class ScreenshotPipelineService:
 
         # 只保留 MODE_DEFS 中定义的有效模式，过滤掉未知/已废弃的键
         valid_modes = set(self._overlay.MODE_DEFS.keys()) if hasattr(self._overlay, 'MODE_DEFS') else {
-            "check_status", "query_parts", "translate"
+            "check_status", "query_parts"
         }
         enabled_modes = [
             k for k, v in self._feature_toggles.items()
@@ -467,114 +486,8 @@ class ScreenshotPipelineService:
             self._overlay.display(S("overlay", "screenshot_done"), auto_hide_ms=3000)
 
     # ════════════════════════════════════
-    #  价格查询（CTRL+T 专用流程）
+    #  跨线程 UI 调用
     # ════════════════════════════════════
-
-    def _do_query_price(self, frame, region):
-        """价格查询完整流程：全屏 GDI 截图 → PPOCRv3 OCR（区域过滤）→ 纠错 → WM API → 显示。
-
-        与原项目 WarframeMonitor 一致：使用全屏截图保证 DB-Net 像素密度，
-        用户框选区域仅用于过滤 OCR 结果。
-
-        Args:
-            frame: dxcam 框选截图帧 (此参数保留兼容，实际使用 GDI 全屏截图)
-            region: 逻辑坐标区域 (left, top, right, bottom)，用作 OCR 结果过滤
-        """
-        if not self._price_ocr or not self._price_ocr_ready:
-            from data.ui_strings import S
-            self._overlay.display(S("overlay", "db_not_ready"), auto_hide_ms=2000)
-            return
-
-        from data.ui_strings import S
-
-        # 保存状态
-        self._last_region = region
-
-        # 显示提示
-        self._overlay.show()
-        self._overlay.raise_()
-        self._overlay.activateWindow()
-        self._overlay.display(
-            S.format("overlay", "fullscreen_info", w=region[2]-region[0], h=region[3]-region[1]),
-            auto_hide_ms=2000
-        )
-
-        # 启动后台线程执行 OCR + 查询
-        def _run_price_query():
-            try:
-                self._log("info", "价格查询: GDI 截图 + 区域裁剪 OCR", source="_do_query_price")
-
-                # ★ 全屏 GDI 截图
-                from core.services.gdi_capture import gdi_capture_fullscreen
-                full_frame = gdi_capture_fullscreen()
-                if full_frame is None:
-                    self._log("error", "价格查询: GDI 全屏截图失败", source="_do_query_price")
-                    self._invoke_on_main(
-                        lambda: self._overlay.display(S("overlay", "screenshot_failed"), auto_hide_ms=3000)
-                    )
-                    return
-
-                # ★ 关键：先裁剪到用户框选区域，再送入 OCR（与原项目一致）
-                # 原项目只对目标小区域做 OCR，避免全屏 UI 噪声干扰
-                left, top, right, bottom = region
-                cropped = full_frame[top:bottom, left:right]
-
-                # ★ 保存裁剪区域用于调试
-                import cv2, os
-                _dbg = os.path.join(os.path.dirname(__file__), '..', '..', 'debug_ocr')
-                os.makedirs(_dbg, exist_ok=True)
-                cv2.imwrite(os.path.join(_dbg, 'ocr_cropped_input.png'),
-                            cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB) if len(cropped.shape) == 3 and cropped.shape[2] == 3 else cropped)
-
-                if cropped.size == 0 or cropped.shape[0] < 20 or cropped.shape[1] < 20:
-                    self._log("warn", "价格查询: 裁剪区域过小", source="_do_query_price")
-                    self._invoke_on_main(
-                        lambda: self._overlay.display(S("overlay", "no_text_detected"), auto_hide_ms=3000)
-                    )
-                    return
-
-                # 对裁剪后的小图做 OCR（不需要 filter_region）
-                ocr_results = self._price_ocr.recognize(cropped)
-
-                # ★ 坐标偏移：裁剪图坐标 → 全屏坐标（用于 Overlay 标注）
-                off_x, off_y = left, top
-                ocr_results = [
-                    (text, [[p[0] + off_x, p[1] + off_y] for p in box], score)
-                    for text, box, score in ocr_results
-                ]
-
-                if not ocr_results:
-                    self._log("warn", "价格查询: 未检测到文字", source="_do_query_price")
-                    self._invoke_on_main(
-                        lambda: self._overlay.display(S("overlay", "no_text_detected"), auto_hide_ms=3000)
-                    )
-                    return
-
-                self._log("info", f"价格查询: 识别到 {len(ocr_results)} 条", source="_do_query_price")
-
-                dpi = self._overlay._dpi_scale
-                from core.mode_handlers import handle_query_price
-
-                handle_query_price(ocr_results, region, dpi, self._overlay)
-
-                timing = self._price_ocr.get_timing()
-                self._log("ok",
-                          f"价格查询完成 | {timing.get('total', 0):.0f}ms "
-                          f"(检测 {timing.get('db_net', 0):.0f}ms)",
-                          source="_do_query_price")
-
-            except Exception as e:
-                self._log("error", f"价格查询异常: {e}", source="_do_query_price")
-                import traceback
-                traceback.print_exc()
-                error_msg = f"价格查询失败: {e}"
-                self._invoke_on_main(
-                    lambda msg=error_msg: self._overlay.display(msg, auto_hide_ms=4000)
-                )
-
-        # 在后台线程运行
-        t = threading.Thread(target=_run_price_query, daemon=True, name="PriceQuery")
-        t.start()
 
     def _invoke_on_main(self, fn, *args, **kwargs):
         """确保 fn 在主线程执行（用于从后台线程更新 UI）。"""
@@ -584,16 +497,18 @@ class ScreenshotPipelineService:
             # 兼容旧版本
             fn(*args, **kwargs)
 
+    def _safe_ui_call(self, gen: int, fn):
+        """★ 线程安全 UI 调用：仅当代号未过期时才投递到主线程。
+
+        用于替代反复出现的 ``if gen == self._generation: self._invoke_on_main(...)`` 样板代码。
+        """
+        if gen == self._generation:
+            self._invoke_on_main(fn)
+
     def _start_eager_ocr(self, enabled_modes: list[str]):
         """截图后立即启动 OCR，让用户点击按钮时结果已就绪。"""
-        import re
-        relic_modes = [m for m in enabled_modes if re.match(r'check_status|query_parts', m)]
-        item_modes = [m for m in enabled_modes if re.match(r'translate', m)]
-
-        if relic_modes:
+        if any(m in ('check_status', 'query_parts') for m in enabled_modes):
             self._start_ocr('relic', lambda results: None)
-        elif item_modes:
-            self._start_ocr('item', lambda results: None)
 
     # ════════════════════════════════════
     #  OCR 线程管理
@@ -625,26 +540,29 @@ class ScreenshotPipelineService:
 
         self._log("info", f"启动 OCR: {ocr_type}", source="_start_ocr")
 
+        # ★ 捕获当前代号，回调时校验是否过期
+        current_gen = self._generation
+
         def _delayed_ocr():
             if self._ocr_thread is not None and self._ocr_thread.is_alive():
                 return
             self._ocr_worker = _OCRWorker(recognizer, self._last_frame)
             self._ocr_worker.finished.connect(
-                lambda results: self._on_ocr_done(results, ocr_type, callback))
+                lambda results: self._on_ocr_done(results, ocr_type, callback, current_gen))
             self._ocr_thread = threading.Thread(
                 target=self._ocr_worker.run, daemon=True, name=f"OCR-{ocr_type}")
             self._ocr_thread.start()
 
         threading.Timer(0.08, _delayed_ocr).start()
 
-    def _on_thread_finished(self):
-        """OCR 线程结束清理。"""
-        with self._ocr_lock:
-            self._ocr_thread = None
-            self._ocr_worker = None
+    def _on_ocr_done(self, results: list, ocr_type: str, callback: Callable, gen: int):
+        """OCR 完成回调（带代号校验，忽略过期回调）。"""
+        # ★ 代号校验：如果当前代号已变化，说明有新任务启动，此回调应被忽略
+        if gen != self._generation:
+            self._log("info", f"[OCR回调] 过期回调已丢弃 (gen={gen}, current={self._generation})",
+                      source="_on_ocr_done")
+            return
 
-    def _on_ocr_done(self, results: list, ocr_type: str, callback: Callable):
-        """OCR 完成回调。"""
         try:
             if self._last_frame is None:
                 return
@@ -681,12 +599,15 @@ class ScreenshotPipelineService:
             traceback.print_exc()
 
     def _kill_ocr_thread(self):
-        """终止当前 OCR 线程。"""
+        """终止当前 OCR 线程（同时递增代号使旧回调失效）。"""
         with self._ocr_lock:
             thread = self._ocr_thread
             worker = self._ocr_worker
             self._ocr_thread = None
             self._ocr_worker = None
+
+        # ★ 递增代号，使正在运行的旧回调失效
+        self._generation += 1
 
         # 通知 worker 取消
         if worker is not None:
@@ -772,14 +693,6 @@ class ScreenshotPipelineService:
             if unmatched_names:
                 self._log("warn", f"未匹配: {', '.join(unmatched_names)}",
                           source="handle_query_parts")
-
-        elif mode == "translate":
-            self._log("info", "翻译 -- 开始处理", source="handle_translate")
-            result = handle_translate(self._last_items, region, dpi, overlay)
-            if result:
-                total, matched = result
-                self._log("info", f"翻译: {total}个候选 | 匹配 {matched}个",
-                          source="handle_translate")
 
         else:
             self._log("warn", f"未知模式: {mode}", source="_execute_mode")

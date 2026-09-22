@@ -1,20 +1,38 @@
 """
-辅助触发器配置模块
+[L0/L1] core.trigger_config — 辅助触发器配置
+
+职责:
 - 读写 data/triggers.json
 - 定义触发器数据模型和选项枚举
 - 提供默认配置、加载、保存、验证
 
-数据模型设计原则：
-- 使用纯 dict 结构（非 dataclass），方便 JSON 序列化和 UI 直接绑定
-- 动作采用 list[dict] 有序列表，支持多动作串联
-- 每个动作的 "type" 字段决定解析方式，新增动作类型只需扩展 ACTION_TYPES
+数据模型设计原则:
+- 使用纯 dict 结构(非 dataclass),方便 JSON 序列化和 UI 直接绑定
+- 动作采用 list[dict] 有序列表,支持多动作串联
+- 每个动作的 "type" 字段决定解析方式,新增动作类型只需扩展 ACTION_TYPES
+
+依赖: Python 标准库
+被谁用: core.trigger_manager / core.pages.triggers_page
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L0/L1] (core/ 根目录,跨层桥接/全局管理器)
+允许依赖:  视文件而定(本层可持有 widget 引用作桥接,但不实现绘制)
+禁止依赖:  根目录 .py 不允许做业务实现 → 业务放 core/services/
+必读规范:  .trae/rules/开发规范.md §6.7
+
+本文件相关红线:
+- 禁止根目录 .py 持有 widget 绘制逻辑 → 视觉交给 core/widgets/
+- 禁止硬编码资源路径 → 必须 core.constants 取
+- 禁止在根目录定义业务类 → 业务放对应层
+- 禁止反向调用 UI(从 Service → Widget) → 单向数据流
+- 禁止 try/except: pass 吞错 → 必须记录到日志或抛给上层
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.7,别走捷径。
 """
 
 import json
 import os
 import copy
-from pathlib import Path
-from typing import Dict, Optional
 
 
 # ============================================================
@@ -92,10 +110,9 @@ DEFAULT_TRIGGERS = [
 
 
 def _config_path() -> str:
-    """获取触发器配置文件路径。"""
-    data_dir = Path(__file__).resolve().parent.parent / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    return str(data_dir / "triggers.json")
+    """获取触发器配置文件路径(打包/开发环境自适应,见 core.paths)。"""
+    from core.paths import ensure_user_file
+    return str(ensure_user_file("triggers.json"))
 
 
 def load_triggers() -> list[dict]:

@@ -22,6 +22,21 @@
         #     'dpi_scale': float,                      # DPI 缩放比例
         # }
         ...
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L0/L1] (core/ 根目录,跨层桥接/全局管理器)
+允许依赖:  视文件而定(本层可持有 widget 引用作桥接,但不实现绘制)
+禁止依赖:  根目录 .py 不允许做业务实现 → 业务放 core/services/
+必读规范:  .trae/rules/开发规范.md §6.7
+
+本文件相关红线:
+- 禁止根目录 .py 持有 widget 绘制逻辑 → 视觉交给 core/widgets/
+- 禁止硬编码资源路径 → 必须 core.constants 取
+- 禁止在根目录定义业务类 → 业务放对应层
+- 禁止反向调用 UI(从 Service → Widget) → 单向数据流
+- 禁止 try/except: pass 吞错 → 必须记录到日志或抛给上层
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.7,别走捷径。
 """
 import time
 import ctypes
@@ -64,6 +79,9 @@ class RegionSelector:
         self._start_pos = None         # 框选起点（QPoint，逻辑坐标）
         self._current_pos = None       # 当前鼠标位置（QPoint，逻辑坐标）
         self._left_was_down = False    # 上一帧左键是否按下
+        self._right_was_down = False   # ★ 上一帧右键是否按下（用于边沿检测）
+        self._start_time: float = 0.0  # ★ 框选模式启动时间（用于冷却期）
+        self._release_frames: int = 0  # ★ 左键释放连续帧计数（用于防抖）
         self._status_text = ""         # 状态栏文字
         self._track_timer: QTimer | None = None
 
@@ -88,22 +106,22 @@ class RegionSelector:
 
     def start(self):
         """启启动框选模式。"""
+        import time as _time
         self._active = True
+        self._start_time = _time.perf_counter()  # ★ 记录启动时间
         self._start_pos = None
         self._current_pos = self._parent.mapFromGlobal(QCursor.pos())
-        
-        # ★ 修复：采样当前按键状态，避免启动时的残留状态导致误判
-        # 如果左键或右键当前正按下，等待下一帧再开始检测
+
+        # ★ 采样当前按键状态（避免残留状态导致误判）
         self._left_was_down = self._is_key_down(_VK_LBUTTON)
-        right_now = self._is_key_down(_VK_RBUTTON)
-        
-        # 如果右键正按下，设置一个短暂的保护期
-        if right_now:
+        self._right_was_down = self._is_key_down(_VK_RBUTTON)  # ★ 初始化右键状态
+
+        # 如果右键正按下，设置保护期等待按键释放
+        if self._right_was_down:
             print("[RegionSelector] 检测到右键按下，设置保护期...")
-            # 不立即启动定时器，等待 100ms 后再开始
-            QTimer.singleShot(100, self._delayed_start)
+            QTimer.singleShot(150, self._delayed_start)  # ★ 延长到 150ms
             return
-        
+
         self._status_text = S("overlay", "selection_status_idle")
 
         # 修改父窗口属性
@@ -121,9 +139,17 @@ class RegionSelector:
         """延迟启动（等待鼠标状态稳定后）。"""
         if not self._active:
             return
-        
+
         # 重新采样按键状态
         self._left_was_down = self._is_key_down(_VK_LBUTTON)
+        self._right_was_down = self._is_key_down(_VK_RBUTTON)  # ★ 初始化右键状态
+
+        # 如果右键仍在按下，再等一轮
+        if self._right_was_down:
+            print("[RegionSelector] 右键仍按下，继续等待...")
+            QTimer.singleShot(100, self._delayed_start)
+            return
+
         self._status_text = S("overlay", "selection_status_idle")
         
         self._parent.setCursor(Qt.CursorShape.CrossCursor)
@@ -152,6 +178,7 @@ class RegionSelector:
 
     @property
     def is_active(self) -> bool:
+        """当前是否正在框选区域(用户拖鼠标中)。"""
         return self._active
 
     @property
@@ -166,13 +193,19 @@ class RegionSelector:
         if not self._active:
             return
 
+        import time as _time
         pos = self._parent.mapFromGlobal(QCursor.pos())
         self._current_pos = pos
         left_down = self._is_key_down(_VK_LBUTTON)
+        right_down = self._is_key_down(_VK_RBUTTON)
 
-        # 右键取消
-        if self._is_key_down(_VK_RBUTTON):
-            print("[RegionSelector] 右键取消框选")
+        # ★ 冷却期：启动后 300ms 内忽略右键取消（防止上一次操作的按键残留）
+        cooldown = (_time.perf_counter() - self._start_time) < 0.3
+
+        # ★ 右键取消：改为边沿检测（只在右键从"未按下"变为"按下"时触发）
+        #   + 冷却期保护
+        if not cooldown and right_down and not self._right_was_down:
+            print("[RegionSelector] 右键按下 → 取消框选")
             self._finish(cancelled=True)
             return
 
@@ -186,32 +219,41 @@ class RegionSelector:
         if left_down and not self._left_was_down:
             self._start_pos = pos
             self._left_was_down = True
+            self._release_frames = 0  # ★ 重置释放计数
             self._status_text = S.format(
                 "overlay", "selection_status_pressed", x=pos.x(), y=pos.y())
             print(f"[RegionSelector] 左键按下 @ ({pos.x()},{pos.y()})")
 
         # 左键拖拽中
         elif left_down and self._left_was_down:
+            self._release_frames = 0  # ★ 重置释放计数（防抖：任何按下帧都重置）
             if self._start_pos:
                 w = abs(pos.x() - self._start_pos.x())
                 h = abs(pos.y() - self._start_pos.y())
                 self._status_text = S.format(
                     "overlay", "selection_status_dragging", w=w, h=h)
 
-        # 左键松开（完成框选）
+        # ★ 左键松开（带防抖：需连续 2 帧确认才触发，避免 GetAsyncKeyState 单帧误判）
         elif not left_down and self._left_was_down:
-            self._left_was_down = False
-            print(f"[RegionSelector] 左键松开 @ ({pos.x()},{pos.y()})")
-            if self._start_pos:
-                self._status_text = S("overlay", "selection_status_released")
-                self._finish(cancelled=False)
-                return
-            else:
-                self._status_text = S("overlay", "selection_status_idle")
+            self._release_frames += 1
+            if self._release_frames >= 2:  # ★ 连续 2 帧 (~32ms) 确认释放
+                self._left_was_down = False
+                print(f"[RegionSelector] 左键松开(已确认) @ ({pos.x()},{pos.y()})")
+                if self._start_pos:
+                    self._status_text = S("overlay", "selection_status_released")
+                    self._finish(cancelled=False)
+                    return
+                else:
+                    self._status_text = S("overlay", "selection_status_idle")
+            # 防抖期内不更新状态，继续显示拖拽信息
 
         else:
             self._left_was_down = left_down
+            self._release_frames = 0
             self._status_text = S("overlay", "selection_status_idle")
+
+        # ★ 更新右键状态（用于下一帧的边沿检测）
+        self._right_was_down = right_down
 
         self._parent.update()
 
@@ -264,6 +306,8 @@ class RegionSelector:
         self._start_pos = None
         self._current_pos = None
         self._left_was_down = False
+        self._right_was_down = False  # ★ 重置右键状态
+        self._release_frames = 0      # ★ 重置释放计数
         self._status_text = ""
 
         if self._track_timer:
@@ -284,12 +328,19 @@ class RegionSelector:
         if not self._active:
             return
 
-        # 半透明遮罩
-        painter.fillRect(self._parent.rect(), QColor(*OVERLAY_SELECTION_OVERLAY))
+        # 半透明遮罩（强制 70% 不透明度，确保能透过看到屏幕）
+        _sel = OVERLAY_SELECTION_OVERLAY
+        if isinstance(_sel, (list, tuple)) and len(_sel) >= 3:
+            c = QColor(int(_sel[0]), int(_sel[1]), int(_sel[2]), 180)
+        else:
+            c = QColor(str(_sel))
+            c.setAlpha(180)
+        painter.fillRect(self._parent.rect(), c)
 
         # 顶部状态栏
         if self._status_text:
-            painter.fillRect(0, 0, self._parent.width(), 36, QColor(*OVERLAY_BG_COLOR))
+            _bg = OVERLAY_BG_COLOR
+            painter.fillRect(0, 0, self._parent.width(), 36, QColor(*_bg) if isinstance(_bg, (list, tuple)) else QColor(str(_bg)))
             painter.setPen(QColor(str(CYBER_YELLOW)))
             painter.setFont(QFont("Microsoft YaHei", 12))
             painter.drawText(20, 24, self._status_text)

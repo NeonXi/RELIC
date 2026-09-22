@@ -1,11 +1,32 @@
 """
-热键管理模块 —— 使用 Windows API RegisterHotKey + Qt nativeEventFilter 替代 keyboard 库。
+[L0/L1] core.hotkey_manager — 全局热键管理器(Windows API)
 
-职责：
+使用 Windows API RegisterHotKey + Qt nativeEventFilter 替代 keyboard 库。
+原因: keyboard 库在某些 Windows 版本/权限下不可靠。
+
+职责:
 - 注册/更新全局热键
-- 热键健康检查 + 自动恢复
-- 热键变更回调
-- 防重入保护
+- 热键健康检查 + 自动恢复(系统注销后重新注册)
+- 热键变更回调(on_config_changed)
+- 紧急重置(force_reset)
+
+依赖: PySide6.QtCore + Windows API (user32.dll)
+被谁用: core.services.screenshot_pipeline.py
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L0/L1] (core/ 根目录,跨层桥接/全局管理器)
+允许依赖:  视文件而定(本层可持有 widget 引用作桥接,但不实现绘制)
+禁止依赖:  根目录 .py 不允许做业务实现 → 业务放 core/services/
+必读规范:  .trae/rules/开发规范.md §6.7
+
+本文件相关红线:
+- 禁止根目录 .py 持有 widget 绘制逻辑 → 视觉交给 core/widgets/
+- 禁止硬编码资源路径 → 必须 core.constants 取
+- 禁止在根目录定义业务类 → 业务放对应层
+- 禁止反向调用 UI(从 Service → Widget) → 单向数据流
+- 禁止 try/except: pass 吞错 → 必须记录到日志或抛给上层
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.7,别走捷径。
 """
 
 import time
@@ -210,21 +231,38 @@ class HotkeyManager(QAbstractNativeEventFilter):
         self._hotkey_ids.clear()
         self._registered.clear()
 
-        # 第二步：注册新热键
+        # 第二步:注册新热键
+        # 注意: cd_1..cd_4 不走 RegisterHotKey 路线,改用 WH_KEYBOARD_LL 钩子
+        # (LowLevelHotkeyHook in core/services/cd_hotkey_hook.py),原因:
+        #   RegisterHotKey 注册的键组合会被全系统独占拦截 → 1/2/3/4 是游戏
+        #   和系统的核心输入键,一旦注册会全游戏抢键
+        #   WH_KEYBOARD_LL 是"观察者"模式,默认 CallNextHookEx 放行,只用于通知
+        #   → 既能触发 CD 倒计时,又不影响游戏/系统的 1/2/3/4 输入
         action_map = {
             "select": "select", "fullscreen": "fullscreen",
-            "query_price": "query_price",  # CTRL+T 价格查询
             "eye_mask": "eye_mask",
+            "bring_to_front": "bring_to_front",  # CTRL+B 窗口置顶
+            # cd_1..cd_4: 跳过 RegisterHotKey,由 LowLevelHotkeyHook 处理
         }
 
         success_count = 0
         for action, action_name in action_map.items():
             hk_str = hotkeys.get(action, DEFAULT_HOTKEYS[action])
 
-            if not hk_str or '+' not in hk_str:
-                print(f"[热键] [x] 跳过非法热键: {action} -> '{hk_str}'", flush=True)
-                self._log(f"快捷键 {action} 格式非法，使用默认值", "warn", "hotkeys")
-                hk_str = DEFAULT_HOTKEYS[action]
+            if not hk_str:
+                print(f"[热键] [x] 跳过空热键: {action} -> ''", flush=True)
+                continue
+            # 允许无 modifier 的单键(cd_1..cd_4 默认就是 "1".."4"),
+            # 但至少要有 1 个非空键名
+            if '+' in hk_str:
+                # 有 modifier:必须至少一个合法 modifier
+                parts = hk_str.split('+')
+                if any(p.strip() in _MOD_NAME_TO_FLAG for p in parts[:-1]):
+                    pass  # 合法
+                else:
+                    print(f"[热键] [x] 跳过非法热键: {action} -> '{hk_str}'", flush=True)
+                    self._log(f"快捷键 {action} 格式非法，使用默认值", "warn", "hotkeys")
+                    hk_str = DEFAULT_HOTKEYS[action]
 
             mod, vk = _parse_hotkey(hk_str)
             if vk == 0:

@@ -1,5 +1,9 @@
 """
-CyberPanel — 赛博风格面板容器。
+[L4] CyberPanel — 赛博风格面板容器
+
+继承: CyberWidgetMixin + QFrame
+依赖: core.tokens.manager
+职责: 带标题栏的面板,切角+边框+可选 title
 
 用于包裹内容区域的通用面板，提供切角背景、边框和可选的标题栏。
 
@@ -8,6 +12,20 @@ CyberPanel — 赛博风格面板容器。
     panel = CyberPanel(title="数据总览")
     layout = QVBoxLayout(panel.content_widget())
     layout.addWidget(some_content)
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L4] (core/widgets/)
+允许依赖:  core.widgets.base.CyberWidgetMixin, core.tokens.manager, PySide6
+禁止依赖:  core.services/*, core.pages/*, core.state/*, data/*
+必读规范:  .trae/rules/开发规范.md §6.4
+
+本文件相关红线:
+- ✗ 禁止 __init__ 调 super().__init__() → 必须 QFrame.__init__(self, parent)
+- ✗ 禁止 paintEvent 漏 super() → 标题栏文字会消失
+- ✗ 禁止硬编码颜色 / 尺寸 → 必须 self.token() / self.space()
+- ✗ 禁止调 Service / 发网络请求 / 读写 JSON
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.4。
 """
 
 from __future__ import annotations
@@ -113,9 +131,8 @@ class CyberPanel(CyberWidgetMixin, QFrame):
         path = self._chamfered_path(self.rect(), corner, mode="all")
 
         # 背景
-        bg_color = self.token_color("components.panel.bg")
         opacity = float(self.token("components.panel.bg_opacity") or "0.92")
-        bg_color.setAlphaF(opacity)
+        bg_color = self._cyber_immersive_resolve_bg("components.panel.bg", opacity)
         painter.fillPath(path, QBrush(bg_color))
 
         # 边框

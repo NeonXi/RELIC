@@ -1,17 +1,35 @@
 """
-辅助触发器引擎模块
+[L-Service] core.trigger_manager — 辅助触发器引擎
 
-职责：
-- 注册全局鼠标/键盘钩子，监听用户输入事件
+职责:
+- 注册全局鼠标/键盘钩子,监听用户输入事件
 - 匹配事件与已配置的触发器
-- 延迟执行响应动作（按键、鼠标点击、鼠标移动）
+- 延迟执行响应动作(按键、鼠标点击、鼠标移动)
 - 防抖保护 + 线程安全
-- 支持运行时热重载（reload）
+- 支持运行时热重载(reload)
 
-架构设计：
-- TriggerManager 是单例式引擎，由 AppCore 在后台加载完成后创建并启动
-- 所有钩子回调在独立线程中执行，动作执行通过 Timer 延迟到主逻辑线程
-- 动作类型通过 _ACTION_EXECUTORS 字典分发，新增动作类型只需注册一个 executor 函数
+架构设计:
+- TriggerManager 是单例式引擎,由 AppCore 在后台加载完成后创建并启动
+- 所有钩子回调在独立线程中执行,动作执行通过 Timer 延迟到主逻辑线程
+- 动作类型通过 _ACTION_EXECUTORS 字典分发,新增动作类型只需注册一个 executor 函数
+
+依赖: keyboard 库 (全局钩子) + PySide6.QtCore (Timer 延迟执行)
+被谁用: core.services.screenshot_pipeline.py
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L0/L1] (core/ 根目录,跨层桥接/全局管理器)
+允许依赖:  视文件而定(本层可持有 widget 引用作桥接,但不实现绘制)
+禁止依赖:  根目录 .py 不允许做业务实现 → 业务放 core/services/
+必读规范:  .trae/rules/开发规范.md §6.7
+
+本文件相关红线:
+- 禁止根目录 .py 持有 widget 绘制逻辑 → 视觉交给 core/widgets/
+- 禁止硬编码资源路径 → 必须 core.constants 取
+- 禁止在根目录定义业务类 → 业务放对应层
+- 禁止反向调用 UI(从 Service → Widget) → 单向数据流
+- 禁止 try/except: pass 吞错 → 必须记录到日志或抛给上层
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.7,别走捷径。
 """
 
 import random
@@ -158,6 +176,7 @@ class _MouseHookThread:
         self._cb_ref = None  # 防止 GC 回收回调
 
     def start(self):
+        """启动 hook 监听线程(鼠标/键盘共用此模式,幂等,已运行则直接返回)。"""
         if self._running:
             return
         self._running = True
@@ -165,6 +184,7 @@ class _MouseHookThread:
         self._thread.start()
 
     def stop(self):
+        """停止 hook 线程:发 WM_QUIT 消息 + join(2s 超时)。"""
         self._running = False
         if self._hook_handle:
             _user32.PostThreadMessageW(self._thread_id, _WM_QUIT, 0, 0)
@@ -296,6 +316,7 @@ class _KeyboardHookThread:
         self._cb_ref = None
 
     def start(self):
+        """启动 hook 监听线程(鼠标/键盘共用此模式,幂等,已运行则直接返回)。"""
         if self._running:
             return
         self._running = True
@@ -303,6 +324,7 @@ class _KeyboardHookThread:
         self._thread.start()
 
     def stop(self):
+        """停止 hook 线程:发 WM_QUIT 消息 + join(2s 超时)。"""
         self._running = False
         if self._hook_handle:
             _user32.PostThreadMessageW(self._thread_id, _WM_QUIT, 0, 0)
@@ -521,10 +543,12 @@ class TriggerManager:
 
     @property
     def is_running(self) -> bool:
+        """hook 线程是否在运行(供 UI 启停按钮读取状态)。"""
         return self._running
 
     @property
     def triggers(self) -> list[dict]:
+        """所有触发器配置列表的拷贝(返回新 list 防止外部直接修改内部状态)。"""
         return list(self._triggers)
 
     # ================================================================

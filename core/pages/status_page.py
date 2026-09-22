@@ -3,80 +3,54 @@
 
 依赖: widgets/, services/
 职责: 显示数据库统计信息、数据更新/管理操作
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L2] (core/pages/)
+允许依赖:  core.widgets/*, core.services/*(读), PySide6
+禁止依赖:  core.tokens/* 直接调用(只能间接), 任何反向依赖 widgets
+必读规范:  .trae/rules/开发规范.md §6.5
+
+本文件相关红线:
+- ✗ 禁止 setStyleSheet(f"...") → 必须用 Token 或继承自 CyberWidget
+- ✗ 禁止重写 paintEvent → 视觉交给 Widget
+- ✗ 禁止状态检查逻辑在 Page 内实现 → 走 service.check_status()
+- ✗ 禁止硬编码颜色 / 尺寸 → 必须 token / space
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.5,别走捷径。
 """
+
+
 import os
 import sqlite3
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QGridLayout, QFrame,
-    QPushButton, QFileDialog, QMessageBox, QProgressBar,
+    QGridLayout, QFrame, QMessageBox, QProgressBar,
 )
-from PySide6.QtCore import Qt, QTimer, Signal as QtSignal, QObject, QRectF
-from PySide6.QtGui import QColor, QFont, QPainter, QPaintEvent, QPen, QBrush, QPainterPath
+from PySide6.QtCore import Qt, QTimer, Signal as QtSignal, QObject
+from PySide6.QtGui import QFont
 
 from core.pages.base_page import PageBase
 from core.widgets.card import CyberCard
 from core.widgets.button import CyberButton
 from core.widgets.log_viewer import CyberLogViewer
 from core.widgets.manual_update_dialog import ManualUpdateDialog
-from core.widgets.base import CyberWidgetMixin
-from core.tokens.manager import TokenManager
+from core.widgets.stat_card import StatCard, ChamferedFrame
 
 
-# ============================================================
-# 内部组件 — 切角风格的容器
-# ============================================================
-
-class _ChamferedFrame(CyberWidgetMixin, QFrame):
-    """带切角边框的通用容器。"""
-
-    def __init__(self, corner_size=8, parent=None):
-        QFrame.__init__(self, parent)
-        self._corner = corner_size
-        self.setStyleSheet("QFrame { border: none; background: transparent; }")
-
-    def paintEvent(self, event: QPaintEvent) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        path = self._chamfered_path(QRectF(self.rect()), self._corner, mode="br")
-        bg = self.token_color("components.card.bg")
-        bg.setAlphaF(0.85)
-        painter.fillPath(path, QBrush(bg))
-        border = self.token_color("components.card.border")
-        painter.setPen(QPen(border, 1))
-        painter.drawPath(path)
-
-
-class _StatCard(CyberWidgetMixin, QFrame):
-    """统计数字卡片（切角边框）。"""
-
-    def __init__(self, accent_color: str, parent=None):
-        QFrame.__init__(self, parent)
-        self._accent_color = accent_color
-        self.setFixedHeight(90)
-        self.setStyleSheet("QFrame { border: none; background: transparent; }")
-
-    def paintEvent(self, event: QPaintEvent) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        corner = self.space("corner.sm", 6)
-        path = self._chamfered_path(QRectF(self.rect()), corner, mode="br")
-        bg = self.token_color("bg.base")
-        bg.setAlphaF(0.85)
-        painter.fillPath(path, QBrush(bg))
-        # 边框使用各卡片的主题色
-        border_c = QColor(self._accent_color)
-        border_c.setAlphaF(0.25)
-        painter.setPen(QPen(border_c, 1))
-        painter.drawPath(path)
+# 注意: 原 _ChamferedFrame / _StatCard 内嵌类已迁移到 core/widgets/stat_card.py
+# 原因: §6.5 禁止 Page 内嵌自定义控件,只能组装 Widget/Section
 
 
 class StatusPage(PageBase):
+    """数据总览页面(page_id='db_overview')。
+
+    展示本地数据库状态(物品数、遗物数、最后更新时间等),
+    并挂载 _PipelineBridge 接收 Pipeline 推送的实时 OCR 进度。
+    """
     page_id = "db_overview"
     page_title = ""  # 由 nav token 动态获取
     page_icon = "nav_status"
@@ -84,8 +58,9 @@ class StatusPage(PageBase):
     def __init__(self):
         super().__init__()
         self.page_title = self._copy("nav.status", "数据总览")
-        # core/pages/ → core/ → 项目根 → data/
-        self._data_dir = Path(__file__).resolve().parent.parent.parent / 'data'
+        # 数据目录(打包/开发环境自适应,见 core.paths)
+        from core.paths import user_data_dir
+        self._data_dir = user_data_dir()
         self._db_path = str(self._data_dir / 'warframe.db')
         self._updating = False  # 更新进行中标志
         self._pipeline_bridge = None  # 流水线信号桥接（防止 GC）
@@ -98,6 +73,7 @@ class StatusPage(PageBase):
         self._refresh_all_stats()
 
     def build_content(self) -> QWidget:
+        """构建数据总览页(数据库状态卡片 + Pipeline 实时进度)。"""
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(20, 16, 20, 20)
@@ -106,8 +82,7 @@ class StatusPage(PageBase):
         # ── 标题 ──
         title = QLabel(self._copy("status.title", "数据库概览"))
         title.setFont(QFont("Iceberg", self._font_size("lg_xl", 18)))
-        accent = self._color("accent.primary")
-        title.setStyleSheet(f"color: {accent}; padding: 4px 0; background: transparent; border: none;")
+        self._style(title, color="accent.primary", padding=("4px", "0"), transparent=True)
         layout.addWidget(title)
 
         # ── 数据库状态卡片 ──
@@ -131,7 +106,7 @@ class StatusPage(PageBase):
         ]
 
         for i, (key, label, default_val, color) in enumerate(stats_config):
-            card = _StatCard(accent_color=color)
+            card = StatCard(accent_color=color)
             card.setObjectName(f"statCard_{key}")
 
             cl = QVBoxLayout(card)
@@ -139,19 +114,20 @@ class StatusPage(PageBase):
             cl.setSpacing(4)
 
             lbl = QLabel(label)
-            lbl.setStyleSheet(f"color: {self._color('text.tertiary')}; font-size: {self._font_size('xs', 11)}px; background: transparent; border: none;")
+            self._style(lbl, color="text.tertiary", font_size="xs", transparent=True)
             cl.addWidget(lbl)
 
             val = QLabel(default_val)
             val.setObjectName(f"statVal_{key}")
             val.setFont(QFont("Monoton", 22))
-            val.setStyleSheet(f"color: {color}; background: transparent; border: none;")
+            # 动态 color 来自 stats_config 循环变量(已解析的 hex 字面量),走 _style 的字面量通道
+            self._style(val, color=color, transparent=True)
             cl.addWidget(val)
             self._stat_labels[key] = val
 
             sub_lbl = QLabel("")
             sub_lbl.setObjectName(f"statSub_{key}")
-            sub_lbl.setStyleSheet(f"color: {self._color('neutral.dark')}; font-size: {self._font_size('micro', 10)}px; background: transparent; border: none;")
+            self._style(sub_lbl, color="neutral.dark", font_size="micro", transparent=True)
             cl.addWidget(sub_lbl)
             self._stat_labels[f"{key}_sub"] = sub_lbl
 
@@ -241,21 +217,25 @@ class StatusPage(PageBase):
         _pb_bg = self._color("bg.raised")
         _pb_end = self._color("semantic.warning")
         corner_xs = self._spacing('corner.xs', 4)
-        self._progress_bar.setStyleSheet(f"""
-            QProgressBar {{
-                background-color: {_pb_bg};
-                border: 1px solid {accent}40;
-                border-radius: {corner_xs}px;
-                text-align: center;
-                color: {accent};
-                font-size: {self._font_size('sm', 11)}px;
-            }}
-            QProgressBar::chunk {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 {accent}, stop:1 {_pb_end});
-                border-radius: {corner_xs}px;
-            }}
-        """)
+        # 复杂 QSS(多选择器 + 渐变)走 raw 通道
+        self._style(
+            self._progress_bar,
+            raw=(
+                f"QProgressBar {{"
+                f"  background-color: {_pb_bg};"
+                f"  border: 1px solid {accent}40;"
+                f"  border-radius: {corner_xs}px;"
+                f"  text-align: center;"
+                f"  color: {accent};"
+                f"  font-size: {self._font_size('sm', 11)}px;"
+                f"}}"
+                f"QProgressBar::chunk {{"
+                f"  background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+                f"    stop:0 {accent}, stop:1 {_pb_end});"
+                f"  border-radius: {corner_xs}px;"
+                f"}}"
+            ),
+        )
         log_layout.addWidget(self._progress_bar)
 
         layout.addWidget(log_card)
@@ -267,7 +247,7 @@ class StatusPage(PageBase):
 
     def _build_status_card(self) -> QFrame:
         """构建数据库状态卡片。"""
-        card = _ChamferedFrame(corner_size=8)
+        card = ChamferedFrame(corner_size=8)
         card.setObjectName("dbStatusCard")
         card.setFixedHeight(70)
 
@@ -465,6 +445,54 @@ class StatusPage(PageBase):
                 _elapsed_timer.stop()
                 _elapsed_timer.deleteLater()
 
+            # ── 进度节流：避免高频信号阻塞主线程导致鼠标卡顿 ──
+            # 用简单类封装节流状态（替代可变 list 闭包写法，提高可读性）
+            class _ThrottleState:
+                """节流缓冲状态：存储最新进度值，由定时器定期刷到 UI。"""
+                def __init__(self):
+                    self.pct: int = 0           # 整体进度百分比
+                    self.repo_name: str = ""    # 当前仓库名
+                    self.repo_pct: int = 0      # 仓库级进度
+                    self.repo_text: str = ""    # 仓库级状态文字
+
+                def reset(self):
+                    """重置所有状态。"""
+                    self.pct = 0
+                    self.repo_name = ""
+                    self.repo_pct = 0
+                    self.repo_text = ""
+
+            _throttle = _ThrottleState()
+
+            _throttle_timer = QTimer(self)
+            _throttle_timer.setInterval(200)  # 最多 5 次/秒
+            def _flush_throttle():
+                """定时将缓冲的最新值刷到 UI。
+
+                按优先级显示：
+                  1. 有仓库级信息时 → 显示仓库名+状态
+                  2. 只有整体进度时 → 显示百分比
+                """
+                if _throttle.repo_name:
+                    # 仓库级进度（优先显示）
+                    self._progress_bar.setValue(min(_throttle.repo_pct, 100))
+                    self._progress_bar.setFormat(f"{_throttle.repo_name} | {_throttle.repo_text}  %p%")
+                    self._update_status_label.setText(f"[{_throttle.repo_name}] {_throttle.repo_text}")
+                elif _throttle.pct > 0:
+                    # 整体进度
+                    self._update_status_label.setText(
+                        self._copy("status.log_update_progress", "更新中... {pct}%", pct=_throttle.pct))
+                    self._progress_bar.setValue(min(_throttle.pct, 100))
+
+            _throttle_timer.timeout.connect(_flush_throttle)
+            _throttle_timer.start()
+
+            def _stop_throttle():
+                """停止节流定时器并做最终刷新。"""
+                _throttle_timer.stop()
+                _throttle_timer.deleteLater()
+                _flush_throttle()  # 最后刷新确保最终状态正确
+
             def _on_log(level, msg):
                 self._log_viewer.add_log(level, msg, "pipeline")
 
@@ -472,14 +500,14 @@ class StatusPage(PageBase):
                 self._log_viewer.add_log("info", self._copy("status.log_pipeline_step", "[步骤 {step}] {desc}", step=step, desc=desc), "pipeline")
 
             def _on_progress(pct):
-                self._update_status_label.setText(self._copy("status.log_update_progress", "更新中... {pct}%", pct=pct))
-                self._progress_bar.setValue(min(pct, 100))
+                """整体进度回调 — 缓冲到节流状态，不直接更新 UI。"""
+                _throttle.pct = pct
 
             def _on_repo_progress(repo_name: str, pct: int, status_text: str):
-                """分仓库进度回调 — 更新进度条文字和状态标签。"""
-                self._progress_bar.setValue(min(pct, 100))
-                self._progress_bar.setFormat(f"{repo_name} | {status_text}  %p%")
-                self._update_status_label.setText(f"[{repo_name}] {status_text}")
+                """分仓库进度回调 — 缓冲到节流状态，不直接更新 UI。"""
+                _throttle.repo_name = repo_name
+                _throttle.repo_pct = pct
+                _throttle.repo_text = status_text
 
             def _on_finished(result):
                 _stop_timer()
@@ -487,7 +515,8 @@ class StatusPage(PageBase):
                 self._btn_update.setEnabled(True)
                 self._pipeline_bridge = None
                 self._progress_bar.setVisible(False)  # 隐藏进度条
-                if result.get("semantic.success"):
+                _stop_throttle()
+                if result.get("success"):
                     elapsed = result.get("elapsed", 0)
                     self._log_viewer.add_log(
                         "ok",
@@ -497,16 +526,20 @@ class StatusPage(PageBase):
                     self._update_status_label.setText("")
                     QTimer.singleShot(500, self._refresh_all_stats)
                 else:
-                    err = result.get("error", "未知错误")
-                    self._log_viewer.add_log("error", self._copy("status.pipeline_fail", "流水线失败: {err}", err=err), "pipeline")
+                    err = result.get("error", "未知错误 (result 中无 error 字段)")
+                    # 截断过长的 traceback，保留关键信息
+                    if len(err) > 800:
+                        err = err[:800] + "\n... (已截断)"
+                    self._log_viewer.add_log("error", self._copy("status.pipeline_fail", "流水线失败: {err}", err=err.split("\n")[0]), "pipeline")
                     self._update_status_label.setText(self._copy("status.update_fail", "更新失败"))
                     QMessageBox.warning(
                         self, self._copy("status.update_fail_title", "更新失败"),
-                        self._copy("status.update_fail_body", "部分数据库更新失败:\n{err}\n\n已完成的步骤不受影响。", err=err),
+                        self._copy("status.update_fail_body", "部分数据库更新失败:\n{err}\n\n已完成的步骤不受影响。\n\n请查看控制台输出获取完整堆栈信息。", err=err),
                     )
 
             def _on_error(err_msg):
                 _stop_timer()
+                _stop_throttle()
                 self._updating = False
                 self._btn_update.setEnabled(True)
                 self._pipeline_bridge = None

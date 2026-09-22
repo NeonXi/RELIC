@@ -12,6 +12,21 @@
 
 See Also:
     ui-framework-design.md 附录 A: 颜色函数规范
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L-Infrastructure] (core/tokens/)
+允许依赖:  PyYAML, Python 标准库
+禁止依赖:  PySide6 / QtWidgets / QtCore(任何 Qt 命名空间)
+           (Token 是数据层,不能引入 UI)
+必读规范:  .trae/rules/开发规范.md §6.1
+
+本文件相关红线:
+- 禁止 import PySide6 → Token 不能依赖 UI
+- 禁止返回 Qt 对象 → 只能返回 str / int / dict
+- 禁止在 Token 里持有 widget 引用
+- 禁止在 Token 中做 IO(读文件应该 lazy)
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.1。
 """
 
 from __future__ import annotations
@@ -350,3 +365,39 @@ def is_color_value(value: str) -> bool:
     if value.lower() == "transparent":
         return True
     return bool(_HEX_PATTERN.match(value.strip()))
+
+
+# 匹配 CSS rgb(r,g,b) / rgba(r,g,b,a) 函数
+_CSS_RGB_PATTERN = re.compile(
+    r"^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*"
+    r"(?:,\s*([0-9]*\.?[0-9]+)\s*)?\)$",
+    re.IGNORECASE,
+)
+
+
+def css_color_to_hex(value: str) -> str | None:
+    """将 CSS ``rgb()/rgba()`` 函数字符串归一化为 Qt 兼容的十六进制。
+
+    ``QColor(name)`` 不支持 CSS ``rgba(r,g,b,a)`` 函数语法，只认 hex。
+    Token 解析层负责把这类值归一化，避免下游 ``QColor`` 解析失败回退。
+
+    Args:
+        value: 如 ``"rgba(255, 230, 0, 0.15)"`` 或 ``"rgb(255, 0, 0)"``
+
+    Returns:
+        - 带透明: ``"#AARRGGBB"``（与 ``QColor.NameFormat.HexArgb`` 一致，
+          QSS / QColor 通用）
+        - 不透明: ``"#RRGGBB"``
+        - 不匹配或分量越界: ``None``
+    """
+    m = _CSS_RGB_PATTERN.match(value.strip())
+    if not m:
+        return None
+    r, g, b = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if not all(0 <= c <= 255 for c in (r, g, b)):
+        return None
+    a_str = m.group(4)
+    if a_str is None:
+        return f"#{r:02X}{g:02X}{b:02X}"
+    a = round(_clamp(float(a_str), 0.0, 1.0) * 255)
+    return f"#{a:02X}{r:02X}{g:02X}{b:02X}"

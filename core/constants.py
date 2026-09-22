@@ -1,16 +1,34 @@
 """
-WARFRAME-RELIC 共享常量
-- 非主题相关的业务常量（OCR、窗口、计时等）
-- 向后兼容：重新导出主题相关的所有内容
+[L0/L1] core.constants — 全局共享常量
 
-主题配置已拆分为：
-    core.theme_config  — ThemeConfig 单例、theme、预设数据
-    core.theme_proxy   — _ThemeProxy、模块级颜色代理常量
+职责:
+- 非主题相关的业务常量(OCR、窗口、计时等)
+- 向后兼容:重新导出主题相关的所有内容(旧代码无需改动)
+
+主题配置已重构:
+    core.theme_proxy   — 模块级颜色代理常量(从 TokenManager 读)
+    core.theme_config  — **已删除**(2026-06-17 整改 F1 硬编码颜色)
+        旧 ThemeConfig 单例的 _DEFAULTS 字典包含大量硬编码 hex,
+        新体系所有颜色都走 cyberpunk.yaml + TokenManager 单一来源。
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L0/L1] (core/ 根目录,跨层桥接/全局管理器)
+允许依赖:  视文件而定(本层可持有 widget 引用作桥接,但不实现绘制)
+禁止依赖:  根目录 .py 不允许做业务实现 → 业务放 core/services/
+必读规范:  .trae/rules/开发规范.md §6.7
+
+本文件相关红线:
+- 禁止根目录 .py 持有 widget 绘制逻辑 → 视觉交给 core/widgets/
+- 禁止硬编码资源路径 → 必须 core.constants 取
+- 禁止在根目录定义业务类 → 业务放对应层
+- 禁止反向调用 UI(从 Service → Widget) → 单向数据流
+- 禁止 try/except: pass 吞错 → 必须记录到日志或抛给上层
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.7,别走捷径。
 """
 # ============================================================
-# 向后兼容：重新导出主题相关（旧代码无需改动）
+# 向后兼容:重新导出主题相关(旧代码无需改动)
 # ============================================================
-from core.theme_config import theme, ThemeConfig
 from core.theme_proxy import (
     CYBER_YELLOW, CYBER_CYAN, CYBER_MAGENTA, CYBER_ORANGE,
     CYBER_RED, CYBER_GREEN,
@@ -32,28 +50,122 @@ from core.theme_proxy import (
 
 
 # ============================================================
-# 向后兼容：旧 API 函数
+# 向后兼容:旧 API 函数(由调用方迁移后删除)
 # ============================================================
 
 def get_theme() -> dict:
-    """获取当前主题字典的副本。"""
-    return theme.to_dict()
+    """[已废弃] 获取当前主题字典的副本。
+
+    新代码请直接使用::
+        from core.tokens.manager import TokenManager
+        TokenManager.instance().get("accent.primary")
+    """
+    import warnings
+    warnings.warn(
+        "get_theme() 已废弃,请改用 TokenManager.instance().get(token_key)",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _snapshot_theme()
 
 
 def save_theme(data: dict) -> bool:
-    """保存主题到当前预设文件，返回是否成功。"""
-    return theme.save(data)
+    """[已废弃] 保存主题(theme_config 已删除,无操作占位)。"""
+    import warnings
+    warnings.warn(
+        "save_theme() 已废弃,主题热重载请用 TokenManager.reload_preset()",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return True
 
 
 def reload_theme() -> dict:
-    """热重载主题（_ThemeProxy 自动跟随，无需手动同步）。"""
-    theme.reload()
-    return theme.to_dict()
+    """[已废弃] 重新加载主题(theme_config 已删除,仅占位)。"""
+    import warnings
+    warnings.warn(
+        "reload_theme() 已废弃,主题热重载请用 TokenManager.reload_preset()",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _snapshot_theme()
 
 
 def _sync_module_globals():
-    """保留兼容性空函数（_ThemeProxy 已自动代理，无需手动同步）。"""
+    """[已废弃] 保留兼容性空函数(_ThemeProxy 已自动代理,无需手动同步)。"""
     pass
+
+
+def _snapshot_theme() -> dict:
+    """[内部] 从 TokenManager 汇总当前 token,用于旧 API 向后兼容。
+
+    实现要点:
+      1. **映射关系** —— 旧 theme_config 的 key(如 "cyber_yellow")
+         映射到 token yaml 里的对应 key(如 "alias.accent.primary")。
+         映射表是稳定的,主题切换时仅值变化,key 集合不变。
+      2. **单一来源** —— 所有颜色值都从 TokenManager 读,
+         没有任何硬编码 hex 字面量,符合 F1 颜色规范。
+      3. **小写 key 风格** —— 沿用旧 theme_config 的小写下划线 key 命名,
+         方便旧代码 `theme.get("cyber_yellow")` 无缝切换。
+
+    Returns:
+        dict[str, str] —— key=旧 key,value=解析后的 hex 字符串
+    """
+    tm = TokenManager.instance()
+    return {
+        "cyber_yellow":       tm.get("alias.accent.primary"),
+        "cyber_cyan":         tm.get("alias.accent.secondary"),
+        "cyber_magenta":      tm.get("alias.accent.tertiary"),
+        "cyber_orange":       tm.get("alias.semantic.warning"),
+        "cyber_red":          tm.get("alias.semantic.danger"),
+        "cyber_green":        tm.get("alias.semantic.success"),
+        "panel_bg":           tm.get("alias.bg.base"),
+        "card_bg":            tm.get("alias.bg.raised"),
+        "border":             tm.get("alias.border.default"),
+        "text":               tm.get("alias.text.primary"),
+        "text_dim":           tm.get("alias.text.tertiary"),
+        "color_unknown":      tm.get("raw.game.unknown"),
+        "color_gold":         tm.get("raw.game.gold"),
+        "color_silver":       tm.get("raw.game.silver"),
+        "color_copper":       tm.get("raw.game.copper"),
+        "btn_default_bg":     tm.get("alias.bg.raised"),
+        "btn_default_text":   tm.get("alias.accent.primary"),
+        "btn_default_border": tm.get("alias.accent.primary"),
+        "btn_hover_bg":       tm.get("alias.bg.raised"),
+        "btn_hover_text":     tm.get("alias.accent.secondary"),
+        "btn_hover_border":   tm.get("alias.accent.secondary"),
+        "btn_pressed_bg":     tm.get("alias.bg.base"),
+        "btn_disabled_bg":    tm.get("alias.bg.raised"),
+        "btn_disabled_text":  tm.get("alias.text.disabled"),
+        "btn_disabled_border": tm.get("alias.border.subtle"),
+        "brand_bilibili":     tm.get("raw.external.bilibili"),
+        "brand_bilibili_hover": tm.get("raw.external.bilibili_hover"),
+        "brand_github":       tm.get("raw.external.github"),
+        "brand_github_hover": tm.get("raw.external.github_hover"),
+        "label_default":      tm.get("alias.text.secondary"),
+        "progress_gradient_start": tm.get("raw.brand.yellow"),
+        "progress_gradient_mid":   tm.get("raw.brand.red"),
+        "progress_gradient_end":   tm.get("raw.brand.cyan"),
+        "subtle_border":      tm.get("alias.border.subtle"),
+        "muted_text":         tm.get("alias.text.tertiary"),
+        "light_text":         tm.get("alias.text.primary"),
+        "color_black":        tm.get("alias.text.inverse"),
+        "color_dark_gray":    tm.get("alias.text.disabled"),
+        "color_enemy":        tm.get("alias.semantic.danger"),
+        "color_purple":       tm.get("alias.accent.tertiary"),
+        "link_color":         tm.get("alias.semantic.info"),
+        "status_online":      tm.get("alias.semantic.success"),
+        "status_ingame":      tm.get("alias.semantic.info"),
+        "status_offline":     tm.get("alias.text.disabled"),
+        "status_away":        tm.get("alias.semantic.warning"),
+        "json_boolean":       tm.get("alias.accent.tertiary"),
+        "fetch_manual_hint":  tm.get("alias.semantic.warning"),
+        "fetch_error_color":  tm.get("alias.semantic.danger"),
+    }
+
+
+# 延迟导入 TokenManager 避免循环依赖(constants 会被早期模块 import)
+from core.tokens.manager import TokenManager
 
 
 # ============================================================

@@ -1,10 +1,29 @@
 """
-ManualUpdateDialog — 手动更新数据教程对话框。
+[L5] ManualUpdateDialog — 手动更新数据教程对话框
 
-赛博风格对话框，展示：
-  - 数据源文件下载地址（可选中复制）
+继承: CyberWidgetMixin + QDialog
+依赖: core.tokens.manager
+职责: 展示数据源下载/放置教程(无网络/异常时引导用户手动操作)
+
+赛博风格对话框，展示:
+  - 数据源文件下载地址(可选中复制)
   - 文件放置路径说明
   - 操作步骤指南
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L5] (core/widgets/) — 弹窗组件比 L4 多出"独立窗口"能力
+允许依赖:  core.widgets.base.CyberWidgetMixin, core.tokens.manager, PySide6
+禁止依赖:  core.services/*, core.pages/*, core.state/*, data/*
+必读规范:  .trae/rules/开发规范.md §6.4
+
+本文件相关红线:
+- ✗ 禁止 __init__ 调 super().__init__() → 必须 QDialog.__init__(self, parent)
+- ✗ 禁止 paintEvent 漏 super() → 边框/文字会失效
+- ✗ 禁止硬编码颜色 / 尺寸 → 必须 self.token() / self.space()
+- ✗ 禁止 dialog.exec() 阻塞主线程超过 1s → 必须 exec() 或 show() 二选一,别混用
+- ✗ 禁止 dialog 关闭后没释放资源 → __del__ 或 finished 信号里清理
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.4。
 """
 
 from __future__ import annotations
@@ -178,9 +197,10 @@ class ManualUpdateDialog(CyberWidgetMixin, QDialog):
 
         # GitHub 链接（可选中复制）
         url_lbl = _CopyableLabel(repo["url"])
+        # alpha=0.08 与 _border.name()+"40"(≈25% 不透明) 风格一致
         url_lbl.setStyleSheet(
             f"color: {_accent_sec.name()}; "
-            f"background: rgba({_accent_sec.red()}, {_accent_sec.green()}, {_accent_sec.blue()}, 8); "
+            f"background: rgba({_accent_sec.red()}, {_accent_sec.green()}, {_accent_sec.blue()}, 0.08); "
             f"border: 1px solid {_border.name()}40; "
             f"border-radius: 4px; padding: 4px 8px; font-family: Consolas, monospace;"
         )

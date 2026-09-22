@@ -1,13 +1,45 @@
 """
-价格服务模块 — 实时价格查询 + 缓存 + 标注格式化
+[L-Service] core.price_service — 截图物品价格查询服务(混合链路)
 
-仅通过 warframe.market API 实时查询价格，不再依赖本地价格缓存数据库。
-保留内存级缓存（30s TTL）以避免短时间内重复 API 请求。
+⚠️ DEPRECATED (2026-08-07): 内部实现已重写到新架构,但保留本文件作为向后兼容入口。
+新代码请使用:
+  - core.services.price_fetcher.PriceFetcher.instance()
+  - core.services.wm_items_repository.WmItemsRepository.instance()
+  - core.services.search_coordinator.SearchCoordinator.instance()
+  - core.state.price_query_state.PriceQueryState.instance()
+
+仅通过 warframe.market API 实时查询价格,不再依赖本地价格缓存数据库。
+保留内存级缓存(30s TTL)以避免短时间内重复 API 请求。
+
+职责:
+- 单个/批量物品价格查询
+- 内存级缓存(避免重复请求)
+- 集成 prime_parts 精确 slug(纠错 WM 拼写异常如 Kompressa Prime Receiver -> reciever)
+- 价格结果格式化(标注文本)
+
+依赖: 纯 Python 标准库 + sqlite3(读 prime_parts 表)
+禁止: PySide6 / QtWidgets(本模块是纯 Service)
+被谁用: core.services.screenshot_pipeline.py (向后兼容)
 
 用法:
     from core.price_service import PriceService
     svc = PriceService()
-    results = svc.query_prices_batch(matched_items)
+    results = svc.query_prices_batch(matched_items)  # 优先用 item['slug']
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L0/L1] (core/ 根目录,跨层桥接/全局管理器)
+允许依赖:  视文件而定(本层可持有 widget 引用作桥接,但不实现绘制)
+禁止依赖:  根目录 .py 不允许做业务实现 → 业务放 core/services/
+必读规范:  .trae/rules/开发规范.md §6.7
+
+本文件相关红线:
+- 禁止根目录 .py 持有 widget 绘制逻辑 → 视觉交给 core/widgets/
+- 禁止硬编码资源路径 → 必须 core.constants 取
+- 禁止在根目录定义业务类 → 业务放对应层
+- 禁止反向调用 UI(从 Service → Widget) → 单向数据流
+- 禁止 try/except: pass 吞错 → 必须记录到日志或抛给上层
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.7,别走捷径。
 """
 
 import json
@@ -140,7 +172,17 @@ def format_price_annotation(item: dict) -> str:
 # ============================================================
 
 def _name_to_slug(en_name: str) -> str:
-    """将英文物品名转换为 warframe.market slug。"""
+    """将英文物品名转换为 warframe.market slug。
+
+    规则:
+    - 全部小写
+    - 去掉单引号 (如 'MK1-Braton')
+    - ' & ' -> '_' (如 'Cobra & Crane' -> 'cobra_crane')
+    - '&' 直接去掉
+    - 空格 -> 下划线
+    - 连续下划线合并
+    - 首尾下划线去掉
+    """
     slug = en_name.lower()
     slug = slug.replace("'", "")
     slug = slug.replace(" & ", "_")
@@ -196,7 +238,25 @@ def _extract_sell_orders(orders_data: list) -> list[int]:
 
 
 def _compute_weighted_price(sell_prices: list[int]) -> dict:
-    """反压价权重算法：计算加权参考价。"""
+    """反压价权重算法:计算加权参考价。
+
+    原理: 中位数 ±30% 区间内的价格视为正常,赋予权重 1.0;
+         低于中位数 30% 的视为异常低价(刷单/钓鱼),赋予权重 0.1。
+         这样异常低价对加权均价的影响被压低,但仍参与计算。
+
+    Args:
+        sell_prices: 已升序排列的卖价列表(单位: 白金)
+
+    Returns:
+        {
+            'weighted': 反压价加权均价,
+            'median': 中位数,
+            'abnormal_count': 异常低价数量,
+            'abnormal_prices': 异常低价列表,
+            'top3': 最低 3 个卖价(用于显示在标注上),
+            'sample_size': 参与计算的样本数(最多 SELL_ORDER_SAMPLE=20)
+        }
+    """
     if not sell_prices:
         return {
             'weighted': None, 'median': None,
@@ -204,21 +264,25 @@ def _compute_weighted_price(sell_prices: list[int]) -> dict:
             'top3': [], 'sample_size': 0,
         }
 
+    # 只取前 20 个卖单(过多样本不增加精度,且 API 限速)
     sample = sell_prices[:SELL_ORDER_SAMPLE]
     n = len(sample)
 
+    # 计算中位数(偶数取中间两个均值,奇数取正中)
     mid = n // 2
     if n % 2 == 0:
         median = (sample[mid - 1] + sample[mid]) / 2.0
     else:
         median = float(sample[mid])
 
+    # 异常低价阈值: 中位数 * (1 - 30%) = 中位数的 70%
     lower_bound = median * (1 - PRICE_ABNORMAL_THRESHOLD)
 
     total_weight = 0.0
     weighted_sum = 0.0
     abnormal_prices = []
 
+    # 加权累加: 正常价格 weight=1.0, 异常低价 weight=0.1
     for price in sample:
         if price < lower_bound:
             weight = ABNORMAL_WEIGHT
@@ -240,9 +304,17 @@ def _compute_weighted_price(sell_prices: list[int]) -> dict:
     }
 
 
-def _fetch_price_from_api(en_name: str, timeout: float = REALTIME_TIMEOUT) -> Optional[dict]:
-    """实时通过 warframe.market API 查询单个物品价格。"""
-    slug = _get_slug(en_name)
+def _fetch_price_from_api(en_name: str, timeout: float = REALTIME_TIMEOUT, slug: Optional[str] = None) -> Optional[dict]:
+    """实时通过 warframe.market API 查询单个物品价格。
+
+    Args:
+        en_name: 物品英文名（用于缓存 key）
+        timeout: 超时秒数
+        slug: 预计算 slug（可选，prime_parts 等数据源已提供的精确 slug）。
+              为 None 时按 en_name 查 market_items 或规则计算。
+    """
+    if not slug:
+        slug = _get_slug(en_name)
     if not slug:
         return None
 
@@ -336,15 +408,13 @@ class PriceService:
         with self._cache_lock:
             self._cache[en_name.lower()] = (time.time(), price)
 
-    def query_price(self, en_name: str, match_quality: str = '') -> Optional[dict]:
+    def query_price(self, en_name: str, match_quality: str = '', slug: Optional[str] = None) -> Optional[dict]:
         """查询单个物品价格（缓存 → 实时 API）。
 
         Args:
             en_name: 物品英文名
             match_quality: 匹配质量
-
-        Returns:
-            价格 dict 或 None
+            slug: 预计算 slug（可选，prime_parts 等数据源已提供的精确 slug）
         """
         if not en_name:
             return None
@@ -354,7 +424,7 @@ class PriceService:
             return cached if cached else None
 
         try:
-            price = _fetch_price_from_api(en_name)
+            price = _fetch_price_from_api(en_name, slug=slug)
         except Exception:
             price = None
 
@@ -368,10 +438,11 @@ class PriceService:
         """批量查询价格（缓存 + 并发 API）。
 
         先用缓存覆盖，未命中的并发查询 warframe.market API。
+        优先使用 item 中携带的 slug（来自 prime_parts 等数据源）。
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        api_tasks: dict[int, str] = {}
+        api_tasks: dict[int, tuple[str, Optional[str]]] = {}  # idx -> (en_name, slug)
         results: list[Optional[dict]] = [None] * len(matched_items)
 
         for i, item in enumerate(matched_items):
@@ -387,18 +458,19 @@ class PriceService:
                 results[i] = result
                 continue
 
-            api_tasks[i] = en_name
+            # ★ 优先用 item 自带的 slug（prime_parts 提供的精确值）
+            api_tasks[i] = (en_name, item.get('slug'))
 
         if api_tasks:
             with ThreadPoolExecutor(max_workers=min(4, len(api_tasks))) as executor:
                 future_to_idx = {
-                    executor.submit(_fetch_price_from_api, en_name): idx
-                    for idx, en_name in api_tasks.items()
+                    executor.submit(_fetch_price_from_api, en_name, slug=slug): idx
+                    for idx, (en_name, slug) in api_tasks.items()
                 }
                 for future in as_completed(future_to_idx):
                     idx = future_to_idx[future]
                     item = matched_items[idx]
-                    en_name = api_tasks[idx]
+                    en_name, _slug = api_tasks[idx]
                     try:
                         price = future.result()
                     except Exception:

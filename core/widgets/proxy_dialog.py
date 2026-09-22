@@ -1,9 +1,25 @@
 """
-[L5] ProxyDialog — GitHub 代理镜像配置对话框（PySide6 版）。
+[L5] ProxyDialog — GitHub 代理镜像配置对话框(PySide6 版)
 
 依赖: PySide6, tokens/, services/config_service.py
 职责: 编辑 GitHub 代理镜像列表，测试连通性
 复用 core.proxy_config 纯逻辑层。
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L5] (core/widgets/) — 弹窗类,允许多 modal/nested
+允许依赖:  core.widgets.base.CyberWidgetMixin, core.tokens.manager, core.proxy_config
+           (注意:可调 proxy_config 是因为它本身就是纯逻辑层,不是 service)
+禁止依赖:  core.services/*(除 config_service / proxy_config), core.pages/*, data/* 写操作
+必读规范:  .trae/rules/开发规范.md §6.4
+
+本文件相关红线:
+- ✗ 禁止 __init__ 调 super().__init__() → 必须 QDialog.__init__(self, parent)
+- ✗ 禁止 paintEvent 漏 super() → 边框/文字会失效
+- ✗ 禁止硬编码颜色 / 尺寸 → 必须 self.token() / self.space()
+- ✗ 禁止连通性测试在主线程跑 → 必须放 ThreadPoolExecutor
+- ✗ 禁止 dialog.exec() 与 show() 混用
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.4。
 """
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -48,6 +64,7 @@ class _ProxyTestWorker(QObject):
             self._executor.shutdown(wait=False, cancel_futures=True)
 
     def run(self):
+        """QThread 主入口:对每个 repo 遍历镜像测速,选最快源并 emit 结果。"""
         repos = get_repo_defs()
         # 构建任务列表: [(repo_name, mirror_idx, mirror_url), ...]
         tasks = []

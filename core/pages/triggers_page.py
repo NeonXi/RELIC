@@ -1,14 +1,34 @@
 """
-Triggers Page — 辅助触发器配置页面。
+[L2] TriggersPage — 辅助触发器配置页面
 
-遵循 ui-framework-design.md 规范：
-  - Token 驱动（颜色/字号/间距/文案全部从 Token 获取）
-  - Copy Token 驱动（所有用户可见文字通过 _copy() 获取）
+依赖: widgets/, core.trigger_config (纯数据层)
+职责: 增删改辅助触发器(鼠标/键盘钩子 + 动作链),即时生效并热重载
+
+数据层: core/trigger_config.py
+引擎:   core.trigger_manager.py
+
+遵循 ui-framework-design.md 规范:
+  - Token 驱动(颜色/字号/间距/文案全部从 Token 获取)
+  - Copy Token 驱动(所有用户可见文字通过 _copy() 获取)
   - 继承原生控件 + 最小化自绘
   - 使用 core/widgets/ 下的赛博风格组件
 
-数据层: core/trigger_config.py
-引擎:   core/trigger_manager.py
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L2] (core/pages/)
+允许依赖:  core.widgets/*, core.trigger_config, core.trigger_manager, PySide6
+禁止依赖:  core.tokens/* 直接调用(只能间接)
+           任何反向依赖 widgets
+必读规范:  .trae/rules/开发规范.md §6.5
+
+本文件相关红线:
+- ✗ 禁止 setStyleSheet(f"...") → 必须用 Token 或继承自 CyberWidget
+- ✗ 禁止重写 paintEvent → 视觉交给 Widget
+- ✗ 禁止直接读写 triggers.json → 走 trigger_config.get() / save()
+- ✗ 禁止在 Page 内安装 keyboard 钩子 → 调 trigger_manager.reload()
+- ✗ 禁止硬编码颜色 / 尺寸 → 必须 token / space
+- ✗ 禁止用户可见文案硬编码 → 必须 _copy() 取自 tokens
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.5。
 """
 
 from __future__ import annotations
@@ -18,13 +38,10 @@ import time
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QSpinBox, QMessageBox, QFrame,
+    QSpinBox, QMessageBox,
 )
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import (
-    QPainter, QColor, QPen, QBrush,
-    QPainterPath, QFont, QCursor,
-)
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont
 
 from core.pages.base_page import PageBase
 from core.widgets.line_edit import CyberLineEdit
@@ -32,6 +49,8 @@ from core.widgets.button import CyberButton
 from core.widgets.card import CyberCard
 from core.widgets.combo_box import CyberComboBox
 from core.widgets.hotkey_edit import HotkeyEdit
+from core.widgets.trigger_status_bar import TriggerStatusBar
+from core.widgets.crosshair_picker import CrosshairPicker
 from core.tokens.manager import TokenManager
 from core.trigger_config import (
     load_triggers, save_triggers,
@@ -54,173 +73,8 @@ def _ui_log(msg: str, tag: str = "UI"):
     print(f"[TRIGGER][{tag}] {ts} | {msg}", file=sys.stderr, flush=True)
 
 
-# ============================================================
-#  _TriggerStatusBar — 自绘开关/摘要控件
-# ============================================================
-
-class _TriggerStatusBar(QFrame):
-    """触发器卡片底部状态栏：[ON/OFF] + 名称 + 摘要，点击切换启用。"""
-
-    toggled = Signal(bool)
-
-    def __init__(self, parent=None):
-        QFrame.__init__(self, parent)
-        self._enabled = False
-        self._name = ""
-        self._summary = ""
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(48)
-
-    def set_state(self, enabled: bool, name: str, summary: str):
-        self._enabled = enabled
-        self._name = name or "unnamed"
-        self._summary = summary
-        self.update()
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._enabled = not self._enabled
-            self.toggled.emit(self._enabled)
-            self.update()
-            event.accept()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        w, h = self.width(), self.height()
-        r = 5
-
-        path = QPainterPath()
-        path.addRoundedRect(0, 0, w, h, r, r)
-
-        if self._enabled:
-            bg = TokenManager.instance().get_qcolor("semantic.warning")
-            border = TokenManager.instance().get_qcolor("accent.primary")
-            text_color = TokenManager.instance().get_qcolor("text.primary")
-        else:
-            bg = QColor(0, 0, 0, 0)
-            border = TokenManager.instance().get_qcolor("border.subtle")
-            text_color = TokenManager.instance().get_qcolor("text.tertiary")
-
-        painter.fillPath(path, QBrush(bg))
-        painter.setPen(
-            QPen(border, 1,
-                  Qt.PenStyle.DashLine if not self._enabled else Qt.PenStyle.SolidLine)
-        )
-        painter.drawPath(path)
-
-        status = "ON" if self._enabled else "OFF"
-        line1 = f"[{status}] {self._name}"
-        line2 = self._summary or "not configured"
-
-        font = QFont()
-        font.setPointSize(12)
-        painter.setFont(font)
-        painter.setPen(text_color)
-        painter.drawText(14, 22, line1)
-
-        font2 = QFont()
-        font2.setPointSize(10)
-        painter.setFont(font2)
-        painter.setPen(text_color.darker(130) if self._enabled else text_color)
-        painter.drawText(14, 40, line2)
-
-
-# ============================================================
-#  _CrosshairPicker — 全屏十字线选点器（PySide6 版）
-# ============================================================
-
-class _CrosshairPicker(QWidget):
-    """全屏十字线取点覆盖层。
-
-    调用 show_overlay() 后显示半透明遮罩 + 红色十字准星，
-    鼠标移动时十字线跟随，左键点击即捕获坐标并发射 position_picked 信号。
-    """
-
-    position_picked = Signal(int, int)
-
-    def __init__(self):
-        super().__init__()
-        self._track_timer = QTimer(self)
-        self._track_timer.timeout.connect(self._update_mouse_pos)
-        self._mouse_pos = None
-
-        # 计算所有屏幕总区域
-        from PySide6.QtGui import QGuiApplication
-        screens = QGuiApplication.screens()
-        total_rect = screens[0].geometry() if screens else self.geometry()
-        for s in screens[1:]:
-            total_rect = total_rect.united(s.geometry())
-        self._total_rect = total_rect
-
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        self.setCursor(Qt.CursorShape.BlankCursor)
-
-    def show_overlay(self):
-        """显示覆盖层（覆盖所有屏幕）。"""
-        self.setGeometry(self._total_rect)
-        self._mouse_pos = None
-        self._track_timer.start(16)  # ~60fps
-        self.show()
-
-    def _update_mouse_pos(self):
-        self._mouse_pos = QCursor.pos()
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pw = self.width()
-        ph = self.height()
-        painter.fillRect(0, 0, pw, ph, QColor(0, 0, 0, 60))
-
-        if not self._mouse_pos:
-            return
-
-        px = self._mouse_pos.x() - self._total_rect.x()
-        py = self._mouse_pos.y() - self._total_rect.y()
-
-        # 红色虚线十字线
-        pen_dash = QPen(QColor(220, 30, 30), 1, Qt.PenStyle.DashLine)
-        painter.setPen(pen_dash)
-        painter.drawLine(0, py, pw, py)
-        painter.drawLine(px, 0, px, ph)
-
-        # 红色实心小十字（中心）
-        pen_solid = QPen(QColor(220, 30, 30), 2)
-        painter.setPen(pen_solid)
-        painter.drawLine(px - 16, py, px + 16, py)
-        painter.drawLine(px, py - 16, px, py + 16)
-
-        # 坐标文字
-        painter.setPen(QColor(255, 255, 255))
-        painter.setFont(QFont("Microsoft YaHei", 11))
-        coord_text = f"X: {self._mouse_pos.x()}  Y: {self._mouse_pos.y()}"
-        fm = painter.fontMetrics()
-        tw = fm.boundingRect(coord_text).width() + 16
-        th = fm.height() + 8
-        tx = px + 20
-        ty = py + 20
-        if tx + tw > pw:
-            tx = px - tw - 20
-        if ty + th > ph:
-            ty = py - th - 20
-        painter.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 180))
-        painter.drawText(tx + 8, ty + fm.ascent() + 4, coord_text)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            pos = QCursor.pos()
-            self.position_picked.emit(pos.x(), pos.y())
-            self._track_timer.stop()
-            self.hide()
+# 注意: 原 _TriggerStatusBar / _CrosshairPicker 内嵌类已迁移到 core/widgets/
+# 原因: §6.5 禁止 Page 内嵌自定义控件
 
 
 # ============================================================
@@ -228,6 +82,11 @@ class _CrosshairPicker(QWidget):
 # ============================================================
 
 class TriggersPage(PageBase):
+    """辅助触发器配置页面。
+
+    列出所有 trigger 任务(如开机自启动、OCR 校时、热键响应),允许启停、编辑。
+    实际触发逻辑在 core/trigger_manager.py,本页只负责 UI 与数据展示。
+    """
     page_id = "triggers"
     page_title = ""
     page_icon = "nav_triggers"
@@ -243,6 +102,7 @@ class TriggersPage(PageBase):
     # ════════════════════════════════════
 
     def build_content(self) -> QWidget:
+        """构建辅助触发器配置页(触发器卡片列表 + 启停/编辑/删除)。"""
         _ui_log("build_content()", "UI_INIT")
         _sp = self._spacing
         _fs = self._font_size
@@ -257,23 +117,25 @@ class TriggersPage(PageBase):
         # ── 标题 ──
         title = QLabel(_cp("triggers.title", "Trigger Config"))
         title.setFont(QFont("Iceberg", _fs("lg_xl", 18)))
-        title.setStyleSheet(f"color: {_co('accent.primary')}; padding: 4px 0;")
+        self._style(title, color="accent.primary", padding=("4px", "0"))
         layout.addWidget(title)
 
         desc = QLabel(
             _cp("triggers.desc",
                 "Detect specified input then auto-execute actions (key / click / move)")
         )
-        desc.setStyleSheet(
-            f"color: {_co('text.tertiary')}; "
-            f"font-size: {_fs('sm', 11)}px; padding: 0 0 12px 0;"
+        self._style(
+            desc,
+            color="text.tertiary",
+            font_size="sm",
+            padding=("0", "0", "12px", "0"),
         )
         desc.setWordWrap(True)
         layout.addWidget(desc)
 
         # ── 卡片容器 ──
         self._cards_container = QWidget()
-        self._cards_container.setStyleSheet("background-color: transparent;")
+        self._style(self._cards_container, transparent=True)
         cards_layout = QVBoxLayout(self._cards_container)
         cards_layout.setContentsMargins(0, 0, 0, 0)
         cards_layout.setSpacing(_sp("sm", 10))
@@ -294,51 +156,8 @@ class TriggersPage(PageBase):
         btn_add.clicked.connect(lambda: self._on_add_trigger_card(cards_layout))
         layout.addWidget(btn_add)
 
-        # ── 提示框 ──
-        tip_frame = self._build_tip_frame()
-        layout.addWidget(tip_frame)
-
         layout.addStretch()
         return container
-
-    # ════════════════════════════════════
-    #  提示框
-    # ════════════════════════════════════
-
-    def _build_tip_frame(self) -> QWidget:
-        frame = QFrame()
-        _accent = TokenManager.instance().get_qcolor("accent.primary")
-        frame.setStyleSheet(f"""
-            QFrame {{
-                background-color: rgba({_accent.red()}, {_accent.green()}, {_accent.blue()}, 0.06);
-                border: 1px solid rgba({_accent.red()}, {_accent.green()}, {_accent.blue()}, 0.2);
-                border-radius: 4px;
-            }}
-        """)
-        layout = QHBoxLayout(frame)
-        layout.setContentsMargins(12, 8, 12, 8)
-
-        icon = QLabel("!")
-        icon.setStyleSheet(
-            f"color: {self._color('accent.primary')}; "
-            f"font-size: {self._font_size('md', 14)}px; font-weight: bold;"
-        )
-        icon.setFixedWidth(20)
-        layout.addWidget(icon)
-
-        text = QLabel(
-            self._copy("triggers.tip",
-                       "Tip: changes auto-save. Mouse-move works with crosshair picker. "
-                       "Keyboard capture temporarily intercepts global hotkeys.")
-        )
-        text.setStyleSheet(
-            f"color: {self._color('alias.text.tertiary')}; "
-            f"font-size: {self._font_size('xs', 11)}px;"
-        )
-        text.setWordWrap(True)
-        layout.addWidget(text, stretch=1)
-
-        return frame
 
     # ════════════════════════════════════
     #  单个触发器卡片
@@ -373,7 +192,9 @@ class TriggersPage(PageBase):
         name_row.setSpacing(8)
 
         name_label = QLabel(_cp("triggers.label_name", "Name:"))
-        name_label.setFixedWidth(40)
+        # 72px 容纳最长中文标签「触发器名称:」(5字+冒号,sm 字号),
+        # 与下方 type_label 对齐;40px 旧值会截断成「触发器」
+        name_label.setFixedWidth(72)
         name_label.setFixedHeight(_h)
         name_label.setStyleSheet(
             f"color: {_co('text.primary')}; "
@@ -396,7 +217,8 @@ class TriggersPage(PageBase):
         trigger_row.setSpacing(8)
 
         type_label = QLabel(_cp("triggers.label_trigger", "Trigger:"))
-        type_label.setFixedWidth(40)
+        # 与上方 name_label 同宽(72px),两行标签左对齐
+        type_label.setFixedWidth(72)
         type_label.setFixedHeight(_h)
         type_label.setStyleSheet(name_label.styleSheet())
 
@@ -503,7 +325,7 @@ class TriggersPage(PageBase):
         # ────────────────────────────────
         #  状态栏（开关 + 摘要）
         # ────────────────────────────────
-        status_bar = _TriggerStatusBar()
+        status_bar = TriggerStatusBar()
         status_bar.set_state(
             bool(trigger_data.get("enabled", False)),
             trigger_data.get("name", ""),
@@ -525,6 +347,7 @@ class TriggersPage(PageBase):
         #  变化回调（即时保存 + 更新摘要）
         # ────────────────────────────────
         def on_change_fn():
+            """单卡片内编辑后的即时回调:同步标题 + 刷新状态栏摘要 + 触发数据保存。"""
             # 同步卡片标题
             new_name = name_input.text().strip()
             title_text = new_name or _cp("triggers.untitled", "Untitled")
@@ -631,11 +454,8 @@ class TriggersPage(PageBase):
         move_coord_label = QLabel(action_data.get("value", "") or "---")
         move_coord_label.setFixedHeight(_h)
         move_coord_label.setMinimumWidth(80)
-        move_coord_label.setStyleSheet(
-            f"background-color: {self._color('bg.base')}; color: {self._color('text.primary')}; "
-            f"border: 1px solid {self._color('border.subtle')}; border-radius: 4px; "
-            f"padding: 4px 8px;"
-        )
+        # 样式抽到 _apply_move_coord_style,便于沉浸黑色模式切换时重新调用
+        self._apply_move_coord_style(move_coord_label)
         move_coord_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         btn_pick_pos = CyberButton(text=_cp("triggers.btn_pick", "Pick"), variant="ghost")
@@ -692,11 +512,16 @@ class TriggersPage(PageBase):
     #  样式工具
     # ════════════════════════════════════
 
-    @staticmethod
-    def _apply_form_style(widget):
-        """对 QSpinBox 应用统一的深色表单样式。"""
+    def _apply_form_style(self, widget):
+        """对 QSpinBox 应用统一的深色表单样式。
+
+        沉浸黑色模式时,背景色覆写为纯黑(走 PageBase 的
+        ``_resolve_immersive_bg_str`` helper,与 CyberWidgetMixin 一致);
+        边框 / 文字色保持原 token,不接入。
+        """
         _tm = TokenManager.instance()
-        base_bg = _tm.get_qcolor("bg.base").name()
+        # 背景:沉浸黑色模式时覆写为纯黑
+        base_bg = self._resolve_immersive_bg_str("bg.base", 1.0)
         base_border = _tm.get_qcolor("border.subtle").name()
         focus_border = _tm.get_qcolor("border.focus").name()
         text_color = _tm.get_qcolor("text.primary").name()
@@ -716,6 +541,35 @@ class TriggersPage(PageBase):
                 f"QSpinBox:focus {{{focus_ss}}}"
             )
 
+    def _apply_move_coord_style(self, label: QLabel) -> None:
+        """对鼠标移动坐标 QLabel 应用样式(沉浸黑色模式时背景覆写为纯黑)。
+
+        从原 _build_action_row 内联 QSS 抽出,便于沉浸模式切换时重新调用。
+        """
+        # 背景:沉浸黑色模式时覆写为纯黑
+        bg = self._resolve_immersive_bg_str("bg.base", 1.0)
+        text = self._tm.get_qcolor("text.primary").name()
+        border = self._tm.get_qcolor("border.subtle").name()
+        label.setStyleSheet(
+            f"background-color: {bg}; color: {text}; "
+            f"border: 1px solid {border}; border-radius: 4px; "
+            f"padding: 4px 8px;"
+        )
+
+    def cyber_refresh_immersive_style(self) -> None:
+        """沉浸模式 / 颜色预设变化时由 AppShell 调用。
+
+        重新应用 QSpinBox 和 move_coord_label 的 QSS,以应用最新沉浸底色。
+        """
+        for cw in self._trigger_card_widgets:
+            spin = cw.get("delay_spin")
+            if isinstance(spin, QSpinBox):
+                self._apply_form_style(spin)
+            for aw in cw.get("action_widgets", []):
+                label = aw.get("move_coord_label")
+                if label is not None:
+                    self._apply_move_coord_style(label)
+
     @staticmethod
     def _wire_action_changes(aw: dict, fn):
         """连接动作行所有变化信号到统一回调。"""
@@ -733,7 +587,7 @@ class TriggersPage(PageBase):
             可连接到 clicked 信号的函数。
         """
         if not hasattr(self, "_crosshair_picker"):
-            self._crosshair_picker = _CrosshairPicker()
+            self._crosshair_picker = CrosshairPicker()
 
         def _open():
             # 断开旧连接
@@ -774,6 +628,7 @@ class TriggersPage(PageBase):
     # ════════════════════════════════════
 
     def _on_add_trigger_card(self, parent_layout):
+        """添加一张空白触发器卡片并立即保存(用户开箱即用)。"""
         blank = create_blank_trigger()
         cw = self._build_trigger_card(blank, parent_layout)
         parent_layout.addWidget(cw["card"])
@@ -818,7 +673,8 @@ class TriggersPage(PageBase):
 
         self._save_all_triggers()
 
-    def _on_status_toggle(self, bar: _TriggerStatusBar, checked: bool):
+    def _on_status_toggle(self, bar: TriggerStatusBar, checked: bool):
+        """启停某条触发器:更新状态栏文字 + 立即保存。"""
         _ui_log(f"status_toggle() | trigger='{bar._name}' | "
                 f"enabled={checked}", "UI_TOGGLE")
         # ★ 即时保存，对端页面（TogglesPage）在 on_enter 时从磁盘读取最新状态。

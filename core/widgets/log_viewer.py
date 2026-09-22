@@ -1,8 +1,23 @@
 """
-[L4] CyberLogViewer — 赛博风格日志输出面板。
+[L4] CyberLogViewer — 赛博风格日志输出面板
 
 依赖: PySide6, tokens/, mixins/cyber_widget_mixin.py
 职责: 显示程序运行日志、支持清空操作
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L4] (core/widgets/)
+允许依赖:  core.widgets.base.CyberWidgetMixin, core.tokens.manager, PySide6
+禁止依赖:  core.services/*, core.pages/*, core.state/*, data/*
+必读规范:  .trae/rules/开发规范.md §6.4
+
+本文件相关红线:
+- ✗ 禁止 __init__ 调 super().__init__() → 必须显式调用目标基类
+- ✗ 禁止 paintEvent 漏 super() → 文字/光标会失效
+- ✗ 禁止硬编码颜色 / 尺寸 → 必须 self.token() / self.space()
+- ✗ 禁止在本控件内直接绑定 logging.Handler → 走 append_message() 接口
+- ✗ 禁止调 Service / 发网络请求 / 写文件
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.4。
 """
 
 from __future__ import annotations
@@ -139,8 +154,9 @@ class CyberLogViewer(CyberWidgetMixin, QFrame):
         self._layout.addWidget(header)
 
     def _apply_text_style(self) -> None:
-        """应用日志文本区样式。"""
-        bg = self.token_color("alias.bg.base")
+        """应用日志文本区样式(沉浸黑色模式时背景覆写为纯黑)。"""
+        # 背景:沉浸黑色模式时覆写为纯黑(QSS 字符串入口)
+        bg = self._cyber_immersive_resolve_token_str("alias.bg.base", 1.0)
         text = self.token_color("alias.text.primary")
         border = self.token_color("alias.border.subtle")
         _accent = self.token_color("accent.secondary")
@@ -149,7 +165,7 @@ class CyberLogViewer(CyberWidgetMixin, QFrame):
 
         self._text_edit.setStyleSheet(f"""
             QTextEdit {{
-                background-color: {bg.name()};
+                background-color: {bg};
                 color: {text.name()};
                 border: 1px solid {border.name()};
                 border-radius: {self.space('corner.xs', 4)}px;
@@ -281,10 +297,9 @@ class CyberLogViewer(CyberWidgetMixin, QFrame):
         corner = self.space("components.panel.corner_size", 10)
         path = self._chamfered_path(self.rect(), corner, mode="all")
 
-        # 背景
-        bg_color = self.token_color("components.panel.bg")
+        # 背景(沉浸黑色模式时覆写 RGB,折减 alpha)
         opacity = float(self.token("components.panel.bg_opacity") or "0.92")
-        bg_color.setAlphaF(opacity)
+        bg_color = self._cyber_immersive_resolve_bg("components.panel.bg", opacity)
         painter.fillPath(path, QBrush(bg_color))
 
         # 边框
@@ -294,3 +309,13 @@ class CyberLogViewer(CyberWidgetMixin, QFrame):
         painter.drawPath(path)
 
         super().paintEvent(event)
+
+    # ── 沉浸黑色模式 / 颜色预设切换刷新 ──
+
+    def cyber_refresh_immersive_style(self) -> None:
+        """沉浸模式 / 颜色预设变化时由 AppShell 调用,重设 QTextEdit 的 QSS。
+
+        _apply_text_style 内的 background-color 走 helper,切换沉浸颜色模式
+        后需要重新构造 QSS 才能应用新底色。
+        """
+        self._apply_text_style()

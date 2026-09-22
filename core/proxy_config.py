@@ -1,18 +1,44 @@
 """
-代理镜像配置管理模块
+[L-Service] core.proxy_config — GitHub 代理镜像配置管理
 
 管理 GitHub 代理镜像列表及其连通性测试结果。
 配置文件: data/proxy_mirrors.json
 
-每个仓库独立记录测试结果，支持智能选择上次成功的代理。
+每个仓库独立记录测试结果,支持智能选择上次成功的代理。
+
+职责:
+- 读取/写入代理镜像列表
+- 测试每个代理的连通性
+- 选择当前最快/最近成功的代理
+
+依赖: Python 标准库 (subprocess 调用 curl/ping)
+禁止: PySide6
+被谁用: core.services.repo_puller.py (下载数据/可执行文件)
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L0/L1] (core/ 根目录,跨层桥接/全局管理器)
+允许依赖:  视文件而定(本层可持有 widget 引用作桥接,但不实现绘制)
+禁止依赖:  根目录 .py 不允许做业务实现 → 业务放 core/services/
+必读规范:  .trae/rules/开发规范.md §6.7
+
+本文件相关红线:
+- 禁止根目录 .py 持有 widget 绘制逻辑 → 视觉交给 core/widgets/
+- 禁止硬编码资源路径 → 必须 core.constants 取
+- 禁止在根目录定义业务类 → 业务放对应层
+- 禁止反向调用 UI(从 Service → Widget) → 单向数据流
+- 禁止 try/except: pass 吞错 → 必须记录到日志或抛给上层
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.7,别走捷径。
 """
 import json
+import os
 import subprocess
 import time
-from pathlib import Path
 from typing import Optional
 
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / "data" / "proxy_mirrors.json"
+# 代理镜像配置(打包/开发环境自适应,见 core.paths;首启自动复制随包模板)
+from core.paths import ensure_user_file as _ensure_user_file
+_CONFIG_PATH = _ensure_user_file("proxy_mirrors.json")
 
 # 仓库配置: (repo_name, owner, repo)
 _REPO_DEFS = {
@@ -164,13 +190,21 @@ def test_repo_mirror(repo_name: str, mirror_template: str, timeout: int = 10) ->
         return False
 
     try:
-        result = subprocess.run(
-            ["git", "ls-remote", "--heads", url],
+        kwargs = dict(
             capture_output=True,
             text=True,
             timeout=timeout,
             encoding="utf-8",
             errors="replace",
+        )
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            kwargs["startupinfo"] = startupinfo
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        result = subprocess.run(
+            ["git", "ls-remote", "--heads", url],
+            **kwargs,
         )
         return result.returncode == 0
     except (subprocess.TimeoutExpired, Exception):

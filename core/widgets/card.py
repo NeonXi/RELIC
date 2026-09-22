@@ -1,5 +1,9 @@
 """
-CyberCard — 赛博风格卡片。
+[L4] CyberCard — 赛博风格卡片
+
+继承: CyberWidgetMixin + QFrame
+依赖: core.tokens.manager
+职责: 轻量级内容卡片,用于展示信息块或可点击项
 
 轻量级内容卡片，用于展示信息块或可点击项。
 比 CyberPanel 更轻量，适合列表内嵌套。
@@ -9,6 +13,21 @@ CyberCard — 赛博风格卡片。
     card = CyberCard()
     layout = QVBoxLayout(card.content_widget())
     layout.addWidget(QLabel("卡片内容"))
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L4] (core/widgets/)
+允许依赖:  core.widgets.base.CyberWidgetMixin, core.tokens.manager, PySide6
+禁止依赖:  core.services/*, core.pages/*, core.state/*, data/*
+必读规范:  .trae/rules/开发规范.md §6.4
+
+本文件相关红线:
+- ✗ 禁止 __init__ 调 super().__init__() → 必须 QFrame.__init__(self, parent)
+- ✗ 禁止 paintEvent 漏 super() → 文字/快捷键会失效
+- ✗ 禁止 paintEvent 顺序写反 → 必须 QPainter → 自绘 → super()
+- ✗ 禁止硬编码颜色 / 尺寸 → 必须 self.token() / self.space()
+- ✗ 禁止调 Service / 发网络请求 / 读写 JSON
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.4。
 """
 
 from __future__ import annotations
@@ -130,14 +149,15 @@ class CyberCard(CyberWidgetMixin, QFrame):
         path = self._chamfered_path(QRectF(self.rect()), corner, mode="br")
 
         # 背景
-        bg_color = self.token_color("components.card.bg")
         state = self._state
 
         if state == "hover" and self._clickable:
-            hover_color = self.token_color("components.list_item.bg_hover")
+            hover_color = self._cyber_immersive_resolve_bg(
+                "components.list_item.bg_hover", 0.85
+            )
             painter.fillPath(path, QBrush(hover_color))
         else:
-            bg_color.setAlphaF(0.85)
+            bg_color = self._cyber_immersive_resolve_bg("components.card.bg", 0.85)
             painter.fillPath(path, QBrush(bg_color))
 
         # 边框

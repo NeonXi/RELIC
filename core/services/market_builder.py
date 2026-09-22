@@ -2,16 +2,36 @@
 [L-Service] 构建 market_items 表（新版本）
 
 从 items 表中提取所有可交易物品，根据规则生成 warframe.market slug 并填充到 market_items 表。
+额外从 Relics.json 补充 Prime 部件蓝图等 All.json 不含的物品。
 从 data/build_market_items.py 迁移而来。
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L-Service] (core/services/)
+允许依赖:  Python 标准库 + data/* + core.hotkey_config 等纯模块
+禁止依赖:  PySide6 / QtWidgets / QtGui / QtCore(Signal 除外)
+           core.widgets/* / core.pages/* / core.recognizers/*
+必读规范:  .trae/rules/开发规范.md §6.2
+
+本文件相关红线:
+- 禁止 import PySide6 → Service 是纯逻辑,不能碰 UI
+- 禁止返回 Qt 对象 → 只能返回 dict / list / str / int / bool
+- 禁止在 Service 中发信号调用 widget → 状态走 core.state / EventBus
+- 禁止未捕获的 IO/网络异常冒泡 → 必须 try/except 降级
+- 禁止在 Service 中持有 widget 引用
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.2。
 """
 
+import json
 import sqlite3
 import time
-from pathlib import Path
 from typing import Optional, Callable
 
 
-_DB_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "warframe.db"
+# 数据库/外部仓库路径(打包/开发环境自适应,见 core.paths)
+from core.paths import app_root as _app_root, ensure_user_file as _ensure_db_file
+_DB_PATH = _ensure_db_file("warframe.db")
+_RELICS_JSON = _app_root() / "external" / "warframe-items_sparse" / "data" / "json" / "Relics.json"
 
 
 def _name_to_slug(en_name: str) -> str:
@@ -130,10 +150,43 @@ def build_market_items(log_callback: Optional[Callable] = None,
             """, batch)
             inserted += len(batch)
 
+        # ★ 补充: 从 Relics.json 提取 All.json 不含的物品（Prime 部件蓝图等）
+        supplemental = 0
+        if _RELICS_JSON.exists():
+            existing_slugs = set(r[0] for r in conn.execute("SELECT slug FROM market_items").fetchall())
+            relic_batch = []
+            with open(_RELICS_JSON, 'r', encoding='utf-8') as f:
+                relics_data = json.load(f)
+            seen = set()
+            for relic in relics_data:
+                for rw in relic.get('rewards', []):
+                    item_data = rw.get('item', {})
+                    wm = item_data.get('warframeMarket', {})
+                    slug = wm.get('urlName', '')
+                    en_name = item_data.get('name', '')
+                    unique_name = item_data.get('uniqueName', '')
+                    if not slug or not en_name or slug in existing_slugs or slug in seen:
+                        continue
+                    seen.add(slug)
+                    is_prime = 1 if 'Prime' in en_name else 0
+                    relic_batch.append((
+                        None, slug, en_name, '', unique_name,
+                        '', 1, is_prime, '',
+                    ))
+            if relic_batch:
+                conn.executemany("""
+                    INSERT OR IGNORE INTO market_items
+                        (id, slug, en_name, zh_name, item_unique, item_type, is_tradable, is_prime, zh_pinyin)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, relic_batch)
+                supplemental = len(relic_batch)
+                _log(f"  Relics.json 补充: {supplemental} 条 (Prime 部件蓝图等)")
+
         conn.commit()
+        total_inserted = inserted + supplemental
         elapsed = round(time.time() - start_time, 1)
-        _log(f"完成: 插入 {inserted} 条, 跳过 {skipped} 条, 耗时 {elapsed}s")
-        return {'inserted': inserted, 'skipped': skipped, 'elapsed': elapsed}
+        _log(f"完成: 基础 {inserted} 条 + 补充 {supplemental} 条 = {total_inserted} 条, 跳过 {skipped} 条, 耗时 {elapsed}s")
+        return {'inserted': total_inserted, 'supplemental': supplemental, 'skipped': skipped, 'elapsed': elapsed}
 
     finally:
         if own_conn:

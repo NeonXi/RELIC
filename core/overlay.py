@@ -1,3 +1,30 @@
+"""
+[L1] core.overlay — 全屏透明覆盖层
+
+职责:
+- 全屏透明窗口(无边框 + 鼠标穿透),用于绘制截图标注和功能按钮
+- 提供框选截图 UI (RegionSelector 组合)
+- 接收 Annotation 列表进行文字标注绘制
+- 维护 OCR 结果功能按钮(出入库/查询/翻译)
+
+依赖: PySide6.QtWidgets + ctypes(用于 Windows GDI 截图)
+被谁用: core.services.screenshot_pipeline.py
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L0/L1] (core/ 根目录,跨层桥接/全局管理器)
+允许依赖:  视文件而定(本层可持有 widget 引用作桥接,但不实现绘制)
+禁止依赖:  根目录 .py 不允许做业务实现 → 业务放 core/services/
+必读规范:  .trae/rules/开发规范.md §6.7
+
+本文件相关红线:
+- 禁止根目录 .py 持有 widget 绘制逻辑 → 视觉交给 core/widgets/
+- 禁止硬编码资源路径 → 必须 core.constants 取
+- 禁止在根目录定义业务类 → 业务放对应层
+- 禁止反向调用 UI(从 Service → Widget) → 单向数据流
+- 禁止 try/except: pass 吞错 → 必须记录到日志或抛给上层
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.7,别走捷径。
+"""
 import time
 import json
 import os
@@ -22,9 +49,9 @@ from core.constants import (
 from data.ui_strings import S
 
 
-def _hex_to_rgb(hex_color: str) -> tuple:
-    """将 #RRGGBB 转为 (R, G, B) 整数元组"""
-    hex_color = hex_color.lstrip('#')
+def _hex_to_rgb(hex_color) -> tuple:
+    """将 #RRGGBB 或 TokenProxy 转为 (R, G, B) 整数元组"""
+    hex_color = str(hex_color).lstrip('#')
     return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
 
@@ -49,6 +76,12 @@ def _get_dpi_scale() -> float:
 
 
 class Overlay(QWidget):
+    """截图功能选择覆盖层。
+
+    用户按热键截图后,本控件弹出模式按钮(check_status/query_parts)。
+    用户选一个 → mode_selected 信号 → main.py 路由到对应处理逻辑。
+    透明背景、置顶显示,支持多屏幕 DPI 缩放。
+    """
     # ★ 新增：功能按钮点击信号，携带 mode 名称
     mode_selected = Signal(str)
 
@@ -80,10 +113,6 @@ class Overlay(QWidget):
         self._right_was_down = False
         self._ignore_right_until = 0      # 框选结束后短暂忽略右键（防误触）
 
-        # ★ 价格查询4等分区域框线（临时显示）
-        self._split_regions = []          # [(rx, ry, rw, rh, label), ...] 物理坐标
-        self._split_regions_until = 0     # 过期时间戳(ms)
-
         # ★ 流式标注：逐条显示的队列和定时器
         self._stream_queue = []          # 待显示的标注队列
         self._stream_timer = QTimer()
@@ -114,20 +143,18 @@ class Overlay(QWidget):
             queue = list(self._dispatch_queue)
             self._dispatch_queue.clear()
         if queue:
-            print(f"[诊断-_handle_dispatch] 处理 {len(queue)} 个调度: {[fn.__name__ for fn, _, _ in queue]}", flush=True)
-        for fn, args, kwargs in queue:
-            try:
-                fn(*args, **kwargs)
-            except Exception as e:
-                print(f"[Overlay._handle_dispatch] 执行 {fn.__name__} 时出错: {e}")
-                import traceback
-                traceback.print_exc()
+            for fn, args, kwargs in queue:
+                try:
+                    fn(*args, **kwargs)
+                except Exception as e:
+                    print(f"[Overlay._handle_dispatch] 执行 {fn.__name__} 时出错: {e}")
+                    import traceback
+                    traceback.print_exc()
 
     def _invoke_on_main(self, fn, *args, **kwargs):
         """确保 fn 在主线程执行。使用 signal 替代 QTimer.singleShot(0)，
         因为后者在 threading.Thread 中因缺少事件循环而永不触发。"""
         if QThread.currentThread() != QApplication.instance().thread():
-            print(f"[诊断-_invoke_on_main] {fn.__name__} 从非主线程调度到主线程", flush=True)
             with self._dispatch_lock:
                 self._dispatch_queue.append((fn, args, kwargs))
             self._dispatch_signal.emit()
@@ -137,18 +164,17 @@ class Overlay(QWidget):
     # ========== 鼠标穿透 ==========
 
     def _apply_mouse_passthrough(self, enabled: bool):
-        # Qt 属性级穿透：窗口本身 + label + preview_label → 穿透
+        # Qt 属性级穿透：窗口本身 + label → 穿透
         # 按钮明确不设穿透（保持可点击）
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, enabled)
         self.label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, enabled)
         for btn in self._mode_buttons.values():
             btn.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)  # ★ 按钮永远不穿透
-        if hasattr(self, '_preview_label'):
-            self._preview_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, enabled)
         # 不再调用 Win32 WS_EX_TRANSPARENT（窗口级穿透会导致按钮无法点击）
 
     def showEvent(self, event):
         super().showEvent(event)
+        # ★ 仅在非框选模式下恢复鼠标穿透（避免与 start_selection 竞态）
         if not self._region_selector.is_active:
             self._apply_mouse_passthrough(True)
 
@@ -178,35 +204,9 @@ class Overlay(QWidget):
         with open(self._config_path(), 'w') as f:
             json.dump({'region': list(self._saved_region)}, f)
 
-    def get_region(self):
-        return self._saved_region
-
-    def show_split_regions(self, regions, duration_ms=2000):
-        """显示4等分区域框线（用于价格查询前确认截图区域）。
-
-        regions: [(x, y, w, h, label), ...] 屏幕物理坐标列表
-        duration_ms: 框线显示时长（毫秒），到时自动清除
-        """
-        if QThread.currentThread() != QApplication.instance().thread():
-            self._invoke_on_main(self.show_split_regions, regions, duration_ms)
-            return
-        self._split_regions = regions
-        self._split_regions_until = int(time.time() * 1000) + duration_ms
-        self.update()
-
-    def _clear_split_regions(self):
-        """清除4等分区域框线。"""
-        if QThread.currentThread() != QApplication.instance().thread():
-            self._invoke_on_main(self._clear_split_regions)
-            return
-        if self._split_regions:
-            self._split_regions = []
-            self._split_regions_until = 0
-            self.update()
-
     def is_showing_content(self) -> bool:
         """检查当前是否有正在显示的内容（标注、按钮、label 等）。
-        
+
         用于全屏截图前判断，防止覆盖层内容被截入图片导致识别异常。
         """
         # 有正在显示的标注（含未过期）
@@ -228,8 +228,6 @@ class Overlay(QWidget):
     MODE_DEFS = {
         "check_status": "mode_check",
         "query_parts":  "mode_query",
-        "query_price":  "mode_price",
-        "translate":    "mode_translate",
     }
 
     def _setup_buttons(self):
@@ -276,9 +274,8 @@ class Overlay(QWidget):
         """截图完成后调用：根据启用的功能动态显示按钮。
 
         Args:
-            enabled_modes: 启用的功能列表，如 ['check_status', 'query_parts', 'query_price']
+            enabled_modes: 启用的功能列表，如 ['check_status', 'query_parts']
         """
-        print(f"[DEBUG show_mode_buttons] called, enabled_modes={enabled_modes}, _selecting={self._region_selector.is_active}, _mode_buttons keys={list(self._mode_buttons.keys())}")
         # 清理旧按钮
         self._hide_mode_buttons()
         for btn in self._mode_buttons.values():
@@ -291,7 +288,6 @@ class Overlay(QWidget):
             self.label.move((self.width() - self.label.width()) // 2, 20)
             self.label.show()
             self._hide_at = 0
-            print("[DEBUG show_mode_buttons] no enabled modes, returning")
             return
 
         from data.icon_loader import get_icon_loader, get_action_icon
@@ -327,7 +323,6 @@ class Overlay(QWidget):
             y = start_y + i * (btn_height + btn_gap)
             btn.setGeometry(start_x, y, btn_width, btn_height)
             btn.show()
-            print(f"[DEBUG show_mode_buttons] btn {mode_id}: geometry=({start_x},{y},{btn_width},{btn_height}), visible={btn.isVisible()}, isWindow={btn.isWindow()}")
 
         # 提示文字放在按钮上方
         self.label.setText(S("overlay", "screenshot_done"))
@@ -336,7 +331,6 @@ class Overlay(QWidget):
         self.label.show()
 
         self._hide_at = 0  # 不自动隐藏，等用户选
-        print(f"[DEBUG show_mode_buttons] done, total buttons={total_btns}, _hide_at={self._hide_at}")
 
     def _hide_mode_buttons(self):
         """隐藏所有功能按钮"""
@@ -349,30 +343,21 @@ class Overlay(QWidget):
         """启启动区域框选模式。"""
         self._log(">> 框选模式启动")
         self._annotations = []
-        self._hide_mode_buttons()
         self._apply_mouse_passthrough(False)
         self.label.hide()
-        if hasattr(self, '_preview_label'):
-            self._preview_label.hide()
         self._hide_at = 0
-        
-        # ★ 修复：启动框选前重置右键状态，防止上次右键清除导致首次框选立即取消
-        self._right_was_down = False
-        self._ignore_right_until = 0
-        
+
+        # ★ 修复：先启动 region_selector（设置 is_active=True），再 show 窗口
+        #   这样 showEvent 检测到 is_active=True 就不会错误地恢复鼠标穿透
+        self._region_selector.start()
+
+        # 现在再禁用穿透并显示窗口
+        self._apply_mouse_passthrough(False)
+
         # 确保 overlay 在最前面且可见
         self.show()
         self.raise_()
-        self._region_selector.start()
-
-    def end_selection(self):
-        """强制结束框选模式。"""
-        self._region_selector.stop()
-        self._apply_mouse_passthrough(True)
-        self.label.show()
-        # 框选结束后 500ms 内忽略右键（防止拖拽时误触右键清除按钮）
-        self._ignore_right_until = int(time.time() * 1000) + 500
-        self.update()
+        self.activateWindow()
 
     def _on_region_selected(self, region_info: dict):
         """RegionSelector 框选完成回调。"""
@@ -476,8 +461,6 @@ class Overlay(QWidget):
     def show_annotations_stream(self, annotations, auto_hide_ms=5000, interval_ms=30, batch_size=2):
         """逐批显示标注，产生「逐步出现」的动画感。"""
         import threading
-        print(f"[诊断-标注流] annotations={len(annotations)}, auto_hide={auto_hide_ms}, "
-              f"thread={threading.current_thread().name}", flush=True)
         if QThread.currentThread() != QApplication.instance().thread():
             self._invoke_on_main(self.show_annotations_stream,
                                  annotations, auto_hide_ms, interval_ms, batch_size)
@@ -490,8 +473,6 @@ class Overlay(QWidget):
 
         # 启动定时器
         self._stream_timer.start(interval_ms)
-        print(f"[诊断-标注流] timer started, interval={interval_ms}, "
-              f"queue={len(self._stream_queue)}, timer_active={self._stream_timer.isActive()}", flush=True)
 
     def _stream_tick(self):
         """每次定时器触发：从队列弹出 batch_size 条追加到显示列表"""
@@ -503,16 +484,11 @@ class Overlay(QWidget):
         self._stream_queue = self._stream_queue[self._stream_batch_size:]
 
         self._annotations.extend(batch)
-        if len(self._annotations) <= 4:
-            print(f"[诊断-stream_tick] annotations={len(self._annotations)}, "
-                  f"queue={len(self._stream_queue)}, "
-                  f"first=({batch[0].x},{batch[0].y}) '{batch[0].text[:30]}'", flush=True)
         self.update()
 
         # 队空则停
         if not self._stream_queue:
             self._stream_timer.stop()
-            print(f"[诊断-stream_tick] 全部完成, annotations={len(self._annotations)}", flush=True)
 
     # ========== 绘制 ==========
 
@@ -523,7 +499,7 @@ class Overlay(QWidget):
         now = int(time.time() * 1000)
         active = [a for a in self._annotations if not a.is_expired(now)]
         if self._annotations and not active:
-            print(f"[诊断-paintEvent] annotations={len(self._annotations)} but all expired!", flush=True)
+            self._annotations = []
         if active:
             painter.setFont(QFont("Microsoft YaHei", 12))
             for a in active:
@@ -531,7 +507,8 @@ class Overlay(QWidget):
                 line_height = fm.height() + 4  # 行高（含行间距）
 
                 # 背景颜色：2077 深蓝黑半透明
-                bg_color = QColor(*OVERLAY_BG_COLOR)
+                _bg = OVERLAY_BG_COLOR
+                bg_color = QColor(*_bg) if isinstance(_bg, (list, tuple)) else QColor(str(_bg))
 
                 if a.is_multiline:
                     # === 多行文本 ===
@@ -556,38 +533,6 @@ class Overlay(QWidget):
                     painter.fillRect(a.x, a.y, 3, th, QColor(str(CYBER_YELLOW)))
                     painter.setPen(QColor(str(a.color)))
                     painter.drawText(a.x + 10, a.y + fm.ascent() + 3, a.text)
-
-        # ★ 绘制4等分区域框线（价格查询用，物理坐标 → 需除以dpi转逻辑坐标）
-        if self._split_regions:
-            dpi = self._dpi_scale
-            colors = [
-                QColor(255, 50, 50),      # 红
-                QColor(50, 255, 50),      # 绿
-                QColor(50, 180, 255),     # 蓝
-                QColor(255, 50, 255),     # 紫
-            ]
-            painter.setFont(QFont("Microsoft YaHei", 10, QFont.Weight.Bold))
-            for idx, (rx, ry, rw, rh, label) in enumerate(self._split_regions):
-                color = colors[idx % len(colors)]
-                # 物理坐标 → 逻辑坐标
-                lx = int(rx / dpi)
-                ly = int(ry / dpi)
-                lw = int(rw / dpi)
-                lh = int(rh / dpi)
-                pen = QPen(color, 3)
-                painter.setPen(pen)
-                painter.drawRect(lx, ly, lw, lh)
-
-                # 标签
-                fm = painter.fontMetrics()
-                label_w = fm.boundingRect(label).width() + 12
-                label_h = fm.height() + 6
-                label_y = ly - label_h - 4
-                if label_y < 0:
-                    label_y = ly + lh + 4
-                painter.fillRect(lx, label_y, label_w, label_h, color)
-                painter.setPen(QColor(255, 255, 255))
-                painter.drawText(lx + 6, label_y + fm.ascent() + 2, label)
 
         # ★ 委托 RegionSelector 绘制框选 UI
         self._region_selector.paint(painter)
@@ -626,14 +571,6 @@ class Overlay(QWidget):
         self.label.show()
         self._hide_at = int(time.time() * 1000) + auto_hide_ms
 
-    def display_preview(self, pixmap, x=50, y=100):
-        if not hasattr(self, '_preview_label'):
-            self._preview_label = QLabel(self)
-        self._preview_label.setPixmap(pixmap)
-        self._preview_label.setStyleSheet("background: transparent;")
-        self._preview_label.move(x, y)
-        self._preview_label.show()
-
     def _check_auto_hide(self):
         now = int(time.time() * 1000)
 
@@ -650,12 +587,9 @@ class Overlay(QWidget):
             if right_now and not self._right_was_down and now > self._ignore_right_until:
                 had_annotations = len(self._annotations) > 0
                 had_buttons = any(btn.isVisible() for btn in self._mode_buttons.values())
-                print(f"[DEBUG _check_auto_hide] RIGHT CLICK DETECTED, had_annotations={had_annotations}, had_buttons={had_buttons}")
                 self.clear_annotations()
                 self._hide_mode_buttons()
                 self.label.clear()
-                if hasattr(self, '_preview_label'):
-                    self._preview_label.hide()
                 self._hide_at = 0
                 if had_annotations:
                     self._log("[x] 右键清除标注")
@@ -666,13 +600,7 @@ class Overlay(QWidget):
         # 自动隐藏计时器
         if self._hide_at and now > self._hide_at:
             self.label.clear()
-            if hasattr(self, '_preview_label'):
-                self._preview_label.hide()
             self._hide_at = 0
-
-        # 清除过期的4等分区域框线
-        if self._split_regions and now > self._split_regions_until:
-            self._clear_split_regions()
 
     def refresh_theme(self):
         """主题变更时刷新 Overlay 中缓存的样式（label、按钮的 stylesheet）。"""

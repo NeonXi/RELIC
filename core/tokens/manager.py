@@ -16,11 +16,25 @@ Token 管理器 — Design Token 的统一访问入口。
 
 See Also:
     ui-framework-design.md §2 颜色系统 — Design Token 架构
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L-Infrastructure] (core/tokens/)
+允许依赖:  PyYAML, Python 标准库
+禁止依赖:  PySide6 / QtWidgets / QtCore(任何 Qt 命名空间)
+           (Token 是数据层,不能引入 UI)
+必读规范:  .trae/rules/开发规范.md §6.1
+
+本文件相关红线:
+- 禁止 import PySide6 → Token 不能依赖 UI
+- 禁止返回 Qt 对象 → 只能返回 str / int / dict
+- 禁止在 Token 里持有 widget 引用
+- 禁止在 Token 中做 IO(读文件应该 lazy)
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.1。
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -30,13 +44,15 @@ except ImportError:
     yaml = None
 
 from core.tokens.resolver import TokenResolver, TokenResolveError
+from core.paths import resource_dir as _resource_dir
 
 
 # ═══════════════════════════════════════════════════
 #  预设文件默认路径
 # ═══════════════════════════════════════════════════
 
-_PRESETS_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "presets"
+# 预设为只读资源:开发环境 = 项目根/data/presets;打包环境 = 解包目录/data/presets
+_PRESETS_DIR = _resource_dir() / "presets"
 
 
 # ═══════════════════════════════════════════════════

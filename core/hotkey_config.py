@@ -1,13 +1,35 @@
 """
-热键配置管理模块
+[L0/L1] core.hotkey_config — 热键配置管理
+
+职责:
 - 读写 data/hotkeys.json
 - 提供默认热键
-- 支持 keyboard 库格式的热键字符串
+- 支持 keyboard 库格式的热键字符串(如 "ctrl+t")
+- 维护热键 UI 标签(HOTKEY_LABELS)
+
+依赖: Python 标准库
+被谁用: core.hotkey_manager / core.pages.hotkeys_page / core.pages.toggles_page
+
+注意: 本模块是纯数据层,无 Qt 依赖
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L0/L1] (core/ 根目录,跨层桥接/全局管理器)
+允许依赖:  视文件而定(本层可持有 widget 引用作桥接,但不实现绘制)
+禁止依赖:  根目录 .py 不允许做业务实现 → 业务放 core/services/
+必读规范:  .trae/rules/开发规范.md §6.7
+
+本文件相关红线:
+- 禁止根目录 .py 持有 widget 绘制逻辑 → 视觉交给 core/widgets/
+- 禁止硬编码资源路径 → 必须 core.constants 取
+- 禁止在根目录定义业务类 → 业务放对应层
+- 禁止反向调用 UI(从 Service → Widget) → 单向数据流
+- 禁止 try/except: pass 吞错 → 必须记录到日志或抛给上层
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.7,别走捷径。
 """
 
 import json
 import os
-from pathlib import Path
 from typing import Dict
 
 from data.ui_strings import S
@@ -17,8 +39,12 @@ from data.ui_strings import S
 DEFAULT_HOTKEYS = {
     "select": "ctrl+g",           # 框选截图
     "fullscreen": "ctrl+h",       # 全屏截图
-    "query_price": "ctrl+t",  # 价格查询（4等分截图+识别+标注）
     "eye_mask": "ctrl+j",     # 护眼遮罩 开关
+    "bring_to_front": "ctrl+b",   # 窗口置顶(一次性拉到最前)
+    "cd_1": "1",              # CD 辅助 技能 1
+    "cd_2": "2",              # CD 辅助 技能 2
+    "cd_3": "3",              # CD 辅助 技能 3
+    "cd_4": "4",              # CD 辅助 技能 4
 }
 
 # 可用的修饰键
@@ -28,16 +54,15 @@ MODIFIERS = ["ctrl", "alt", "shift", "win"]
 HOTKEY_LABELS = {
     "select": S("hotkey", "label_select"),
     "fullscreen": S("hotkey", "label_fullscreen"),
-    "query_price": S("hotkey", "label_query_price"),
     "eye_mask": S("hotkey", "label_eye_mask"),
+    "bring_to_front": S("hotkey", "label_bring_to_front"),
 }
 
 
 def _config_path() -> str:
-    """获取配置文件路径"""
-    data_dir = Path(__file__).resolve().parent.parent / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    return str(data_dir / "hotkeys.json")
+    """获取配置文件路径(打包/开发环境自适应,见 core.paths)"""
+    from core.paths import ensure_user_file
+    return str(ensure_user_file("hotkeys.json"))
 
 
 def load_hotkeys() -> Dict[str, str]:
@@ -105,14 +130,12 @@ def validate_hotkey(hotkey_str: str) -> bool:
 DEFAULT_FEATURE_TOGGLES = {
     "check_status": True,    # 出入库查询
     "query_parts": True,     # 遗物内容查询
-    "translate": False,      # 翻译英文（默认关闭）
 }
 
 # 物品区域配置文件路径
 def _item_region_config_path() -> str:
-    data_dir = Path(__file__).resolve().parent.parent / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    return str(data_dir / "item_region.json")
+    from core.paths import ensure_user_file
+    return str(ensure_user_file("item_region.json"))
 
 
 def _load_item_regions_raw() -> dict:
@@ -207,7 +230,6 @@ def _get_feature_toggle_label(key: str) -> str:
     return {
         "check_status": "出入库查询",
         "query_parts": "遗物内容查询",
-        "translate": "自动翻译",
     }.get(key, key)
 
 
@@ -223,16 +245,13 @@ FEATURE_TOGGLE_REQUIRES = {
     # 每个功能需要什么 OCR 类型
     "check_status": "relic",
     "query_parts": "relic",
-    "translate": "text",
 }
 
 
 def _feature_config_path() -> str:
-    """获取功能开关配置文件路径。"""
-    from pathlib import Path
-    data_dir = Path(__file__).resolve().parent.parent / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    return str(data_dir / "feature_toggles.json")
+    """获取功能开关配置文件路径(打包/开发环境自适应,见 core.paths)。"""
+    from core.paths import ensure_user_file
+    return str(ensure_user_file("feature_toggles.json"))
 
 
 def load_feature_toggles() -> dict:

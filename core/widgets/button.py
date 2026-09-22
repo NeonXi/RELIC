@@ -1,11 +1,16 @@
 """
-CyberButton — 赛博风格按钮。
+[L4] CyberButton — 赛博风格按钮
 
-四种视觉变体：
-- solid:    实心填充（主操作）
-- outlined: 描边边框（次操作）
-- ghost:    幽灵透明（第三操作）
-- danger:   红色危险（删除/破坏性操作）
+继承: CyberWidgetMixin + QPushButton
+依赖: core.tokens.manager
+职责: 自绘切角+外发光,四种变体(solid/outlined/ghost/danger)
+信号: clicked(继承自 QPushButton)
+
+四种视觉变体:
+- solid:    实心填充(主操作)
+- outlined: 描边边框(次操作)
+- ghost:    幽灵透明(第三操作)
+- danger:   红色危险(删除/破坏性操作)
 
 使用方式::
 
@@ -13,6 +18,23 @@ CyberButton — 赛博风格按钮。
     btn = CyberButton("取消", variant="outlined")
     btn = CyberButton("详情", variant="ghost")
     btn = CyberButton("删除", variant="semantic.danger")
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L4] (core/widgets/)
+允许依赖:  core.widgets.base.CyberWidgetMixin, core.tokens.manager, PySide6
+禁止依赖:  core.services/*, core.pages/*, core.state/*, data/*
+           (Widget 只绘制和发信号,绝不调业务/数据)
+必读规范:  .trae/rules/开发规范.md §6.4 (L4/L5 控件层)
+
+本文件相关红线:
+- ✗ 禁止 __init__ 调 super().__init__() → 必须 QPushButton.__init__(self, text, parent)
+- ✗ 禁止 paintEvent 漏 super() → 文字/快捷键会失效
+- ✗ 禁止 paintEvent 顺序写反 → 必须 QPainter → 自绘 → super()
+- ✗ 禁止硬编码颜色 "#FF0000" 或尺寸 26 → 必须 self.token() / self.space()
+- ✗ 禁止调 Service / 发网络请求 / 读写 JSON → Widget 只画 UI
+- ✗ 禁止用 _xxx 命名私有属性 → 必须 _cyber_xxx 前缀
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.4,别走捷径。
 """
 
 from __future__ import annotations

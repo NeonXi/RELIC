@@ -28,6 +28,22 @@
 
     # 分类列表
     cats = svc.get_categories()
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L-Service] (core/services/)
+允许依赖:  Python 标准库 + data/* + core.hotkey_config 等纯模块
+禁止依赖:  PySide6 / QtWidgets / QtGui / QtCore(Signal 除外)
+           core.widgets/* / core.pages/* / core.recognizers/*
+必读规范:  .trae/rules/开发规范.md §6.2
+
+本文件相关红线:
+- 禁止 import PySide6 → Service 是纯逻辑,不能碰 UI
+- 禁止返回 Qt 对象 → 只能返回 dict / list / str / int / bool
+- 禁止在 Service 中发信号调用 widget → 状态走 core.state / EventBus
+- 禁止未捕获的 IO/网络异常冒泡 → 必须 try/except 降级
+- 禁止在 Service 中持有 widget 引用
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.2。
 """
 
 import logging
@@ -40,9 +56,9 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ===== 路径 =====
-DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
-DB_PATH = DATA_DIR / "warframe.db"
+# ===== 路径(打包/开发环境自适应,见 core.paths) =====
+from core.paths import ensure_user_file as _ensure_db_file
+DB_PATH = _ensure_db_file("warframe.db")
 
 # ===== 拼音支持 =====
 try:
@@ -574,9 +590,75 @@ class ItemService:
         try:
             rows = conn.execute(
                 "SELECT DISTINCT type FROM items WHERE category = ? ORDER BY type",
-                (category,)
+                (category,),
             ).fetchall()
             return [r[0] for r in rows]
+        finally:
+            self._close(conn)
+
+    # ============================================================
+    # Prime 部件 API（用于 SearchCoordinator 部件补全,2026-08-07）
+    # ============================================================
+
+    def get_prime_parts_for_warframes(self, warframe_en_names: list[str]) -> list[dict]:
+        """根据战甲英文名列表,查询对应的 Prime 部件。
+
+        用途: SearchCoordinator 方案 A — 搜到 Prime 战甲本体后,扩展其部件
+        (Blueprint/Chassis/Neuroptics/Systems 等) 作为完整搜索结果。
+
+        数据源: warframe.db 的 prime_parts 表(596 条,带完整 zh_name + slug)
+
+        Args:
+            warframe_en_names: 战甲英文名列表,如 ["Rhino Prime", "Volt Prime"]
+                              必须是 items.name 里的精确字符串(Prime 战甲本体)
+
+        Returns:
+            [
+                {
+                    "en_name":   "Rhino Prime Blueprint",
+                    "zh_name":   "Rhino Prime 蓝图",
+                    "slug":      "rhino_prime_blueprint",  # WM 可直接用
+                    "part_type": "Blueprint",              # Blueprint/Chassis/Neuroptics/Systems/...
+                    "parent_en": "Rhino Prime",
+                },
+                ...
+            ]
+            按 (parent_en, part_type) 排序。
+        """
+        if not warframe_en_names:
+            return []
+        # 去重,避免 IN 子句过大
+        unique_names = sorted({n.strip() for n in warframe_en_names if n.strip()})
+        if not unique_names:
+            return []
+
+        conn = self._get_conn()
+        if conn is None:
+            return []
+        try:
+            placeholders = ",".join("?" * len(unique_names))
+            cur = conn.execute(
+                f"SELECT en_name, zh_name, slug, part_type, parent_en "
+                f"FROM prime_parts WHERE parent_en IN ({placeholders}) "
+                f"ORDER BY parent_en, "
+                f"CASE part_type "
+                f"  WHEN 'Blueprint' THEN 0 "
+                f"  WHEN 'Chassis' THEN 1 "
+                f"  WHEN 'Neuroptics' THEN 2 "
+                f"  WHEN 'Systems' THEN 3 "
+                f"  ELSE 4 END",
+                unique_names,
+            )
+            results: list[dict] = []
+            for r in cur.fetchall():
+                results.append({
+                    "en_name": r[0] or "",
+                    "zh_name": r[1] or "",
+                    "slug": (r[2] or "").strip(),
+                    "part_type": r[3] or "",
+                    "parent_en": r[4] or "",
+                })
+            return results
         finally:
             self._close(conn)
 
@@ -730,7 +812,9 @@ class ItemService:
 
     # ── 掉落来源 / 遗物内容 ──
 
-    def get_drop_sources(self, item_name: str, unique_name: str = "", max_results: int = 40) -> list[dict]:
+    def get_drop_sources(
+        self, item_name: str, unique_name: str = "", max_results: int | None = 40
+    ) -> list[dict]:
         """查询物品的掉落来源（所有类型，含中文化）。
 
         优先通过 unique_name 精确匹配，其次用 item_name LIKE 模糊匹配。
@@ -738,7 +822,7 @@ class ItemService:
         Args:
             item_name: 物品英文名
             unique_name: 物品唯一标识（如 /Lotus/Powersuits/...），可选
-            max_results: 最大返回条数
+            max_results: 最大返回条数，传入 None 或 0 表示不限制
 
         Returns:
             [{location, rarity, chance, rotation?, source_type}, ...]
@@ -1012,6 +1096,8 @@ class ItemService:
                     deduped[loc_key] = s
 
             results = sorted(deduped.values(), key=lambda x: x.get('chance', 0), reverse=True)
+            if max_results is None or max_results <= 0:
+                return results
             return results[:max_results]
 
         finally:
@@ -1102,15 +1188,17 @@ class ItemService:
         finally:
             self._close(conn)
 
-    def get_relic_drop_locations(self, relic_name: str) -> list[dict]:
+    def get_relic_drop_locations(
+        self, relic_name: str, max_results: int | None = 40
+    ) -> list[dict]:
         """查询遗物自身的掉落途径（从哪些任务节点掉落）。
 
         Args:
             relic_name: 遗物名称，如 "Axi A1"
+            max_results: 最大返回条数，传入 None 或 0 表示不限制
 
         Returns:
             (locations: [{planet, node_name, game_mode, rotation, chance}, ...], total: int)
-            locations 最多 40 条
         """
         conn = self._get_conn()
         if not conn:
@@ -1164,7 +1252,10 @@ class ItemService:
 
             sorted_locs = sorted(deduped.values(),
                           key=lambda x: (x['planet'], x['node_name']))
-            return sorted_locs[:40], len(sorted_locs)
+            total = len(sorted_locs)
+            if max_results is None or max_results <= 0:
+                return sorted_locs, total
+            return sorted_locs[:max_results], total
 
         finally:
             self._close(conn)

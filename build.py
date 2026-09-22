@@ -1,484 +1,281 @@
 """
-build.py - 打包脚本
-========
-使用 PyInstaller 将项目打包为 onedir 格式，带进度显示。
+[L0-Build] build.py — WARFRAME-RELIC 一键打包脚本(构建工具,非运行时代码)
+
+依赖: Python 标准库 + PyInstaller(命令行调用)
+职责: onedir 打包 + 资源显式清单 + hiddenimports 自动扫描 + 自检 + 冒烟 + ZIP
+必读: .trae/documents/打包EXE方案.md §4.4
 
 用法:
-    python build.py              # 默认打包
-    python build.py --clean      # 清理旧构建后重新打包
-    python build.py --no-console # 打包后不显示控制台窗口
+    python build.py              # 完整构建 + 自检 + 冒烟
+    python build.py --zip        # 构建完成后生成发行 ZIP(dist/*.zip)
+    python build.py --no-smoke   # 跳过冒烟测试
+    python build.py --no-clean   # 复用 PyInstaller 缓存(增量构建,更快)
 
-输出:
-    dist/WARFRAME-RELIC/         # onedir 文件夹
+设计要点:
+    1. hiddenimports 自动扫描 core/ 与 data/ 全部本地模块 —— 新增文件零维护;
+       覆盖 app_shell 字符串懒加载页面(core.pages.xxx:WorldstatePage)这类
+       PyInstaller 静态分析看不到的模块。
+    2. datas 白名单显式化 —— data/ 中的旧管线遗留(all.json / dict.*.json)
+       与运行期缓存(wm_items_cache.json)不进包,省 ~14MB。
+    3. --windowed:不显示 CMD 窗口(用户决策,方案 §8.1)。
+    4. UPX 关闭,降低杀软误报。
+    5. 入口 dev.py:frozen 分支自动跳过提权/装依赖,直接运行 Qt 应用。
 """
 
-import sys
-import os
+from __future__ import annotations
+
+import argparse
 import shutil
 import subprocess
+import sys
 import time
-import threading
 from pathlib import Path
-from datetime import datetime
 
-# ══════════════════════════════════════════════
-# 配置
-# ══════════════════════════════════════════════
+PROJECT = Path(__file__).resolve().parent
+APP_NAME = "WARFRAME-RELIC"
+ENTRY = PROJECT / "dev.py"
+DIST = PROJECT / "dist"
+BUILD_DIR = PROJECT / "build"
+APP_DIR = DIST / APP_NAME            # dist/WARFRAME-RELIC/
+INTERNAL = APP_DIR / "_internal"     # dist/WARFRAME-RELIC/_internal/
 
-PROJECT_DIR = Path(__file__).resolve().parent
-DIST_DIR = PROJECT_DIR / "dist"
-BUILD_DIR = PROJECT_DIR / "build"
-NAME = "WARFRAME-RELIC"
-ENTRY = PROJECT_DIR / "dev.py"
+# data/ 顶层不进包的 json:旧管线遗留 + 运行期缓存(首启自动生成)
+_DATA_JSON_EXCLUDE = {
+    "all.json",            # 6MB 旧管线遗留(运行时只读 external/ 下的同名文件)
+    "dict.en.json",        # 3.8MB 旧管线遗留
+    "dict.zh.json",        # 3.8MB 旧管线遗留
+    "wm_items_cache.json", # 价格查询缓存,冷启动后自动重建
+}
 
-# 要打包的数据目录 (src, dst)
-DATA_DIRS = [
-    ("assets", "assets"),
-    ("data", "data"),
-    ("icon", "icon"),
-]
+# ── 日志 ──────────────────────────────────────────────────────────────
 
-# 要打包的单独文件 (src, dst)
-DATA_FILES = [
-    ("qt.conf", "."),
-    ("yolov5nu.pt", "."),
-]
-
-# 需要显式包含的隐藏导入
-HIDDEN_IMPORTS = [
-    # Qt
-    "PySide6.QtCore",
-    "PySide6.QtGui",
-    "PySide6.QtWidgets",
-    "PySide6.QtSvg",
-    "PySide6.QtNetwork",
-    # 核心依赖
-    "cv2",
-    "numpy",
-    "pypinyin",
-    "yaml",
-    "PIL",
-    "PIL.Image",
-    "dxcam",
-    "comtypes",
-    "comtypes.stream",
-    "rapidocr_onnxruntime",
-    "rapidocr_onnxruntime.ch_ppocr_v4_rec",
-    "rapidocr_onnxruntime.ch_ppocr_v4_det",
-    # 项目内部模块
-    "core",
-    "core.app_shell",
-    "core.annotation",
-    "core.constants",
-    "core.fonts",
-    "core.hotkey_config",
-    "core.hotkey_manager",
-    "core.mode_handlers",
-    "core.overlay",
-    "core.price_service",
-    "core.proxy_config",
-    "core.region_selector",
-    "core.theme_config",
-    "core.theme_proxy",
-    "core.trigger_config",
-    "core.trigger_manager",
-    "core.word_wrap_button",
-    "core.pages",
-    "core.pages.base_page",
-    "core.services",
-    "core.services._event_emitter",
-    "core.services.db_builder",
-    "core.services.db_connections",
-    "core.services.item_service",
-    "core.services.localization_service",
-    "core.services.market_builder",
-    "core.services.market_price_service",
-    "core.services.pipeline",
-    "core.services.repo_puller",
-    "core.services.screenshot_pipeline",
-    "core.recognizers",
-    "core.recognizers.base_ocr",
-    "core.recognizers.item_name",
-    "core.recognizers.matcher",
-    "core.recognizers.mod_name",
-    "core.recognizers.part_mappings",
-    "core.recognizers.relic_name",
-    "core.state",
-    "core.state.app_state",
-    "core.state.event_bus",
-    "core.tokens",
-    "core.tokens.color_utils",
-    "core.tokens.manager",
-    "core.tokens.resolver",
-    "core.widgets",
-    "core.widgets.base",
-    "core.widgets.button",
-    "core.widgets.card",
-    "core.widgets.combo_box",
-    "core.widgets.hotkey_edit",
-    "core.widgets.line_edit",
-    "core.widgets.log_viewer",
-    "core.widgets.manual_update_dialog",
-    "core.widgets.panel",
-    "core.widgets.pixel_font_editor",
-    "core.widgets.proxy_dialog",
-    "core.widgets.relic_tooltip",
-    "core.widgets.splash_screen",
-    "core.widgets.toggle_switch",
-    "data",
-    "data.icon_loader",
-    "data.item_index",
-    "data.preset_normal",
-    "data.ui_strings",
-    "data.wfinfo_relics",
-]
-
-# 排除的模块
-EXCLUDE_MODULES = [
-    "tests",
-    "docs",
-    "pip",
-    "setuptools",
-    "wheel",
-]
-
-# ══════════════════════════════════════════════
-# 工具函数
-# ══════════════════════════════════════════════
-
-def _ts() -> str:
-    return datetime.now().strftime("%H:%M:%S")
+def _log(msg: str) -> None:
+    print(f"[build] {msg}", flush=True)
 
 
-def _log(msg: str, level: str = "info"):
-    colors = {
-        "info": "\033[36m",     # cyan
-        "ok": "\033[32m",       # green
-        "warn": "\033[33m",     # yellow
-        "error": "\033[31m",    # red
-        "step": "\033[35m",     # magenta
-        "reset": "\033[0m",
-    }
-    prefix = {
-        "info": "  ",
-        "ok": "  ✓",
-        "warn": "  ⚠",
-        "error": "  ✗",
-        "step": "▶",
-    }
-    c = colors.get(level, colors["info"])
-    p = prefix.get(level, "  ")
-    reset = colors["reset"]
-    print(f"{c}[{_ts()}] {p} {msg}{reset}", flush=True)
+def _ok(msg: str) -> None:
+    print(f"[build]   OK  {msg}", flush=True)
 
 
-class ProgressBar:
-    """简易终端进度条，无外部依赖。"""
-
-    def __init__(self, total: int, desc: str = "", width: int = 40):
-        self.total = max(1, total)
-        self.current = 0
-        self.desc = desc
-        self.width = width
-        self._start_time = time.time()
-        self._lock = threading.Lock()
-
-    def update(self, n: int = 1):
-        with self._lock:
-            self.current = min(self.total, self.current + n)
-            self._render()
-
-    def set(self, value: int):
-        with self._lock:
-            self.current = min(self.total, value)
-            self._render()
-
-    def _render(self):
-        pct = self.current / self.total
-        filled = int(self.width * pct)
-        bar = "█" * filled + "░" * (self.width - filled)
-        elapsed = time.time() - self._start_time
-        if pct > 0:
-            eta = elapsed / pct * (1 - pct)
-            eta_str = f"{eta:.0f}s" if eta < 60 else f"{eta/60:.1f}m"
-        else:
-            eta_str = "..."
-
-        print(
-            f"\r  \033[36m{self.desc}\033[0m "
-            f"\033[33m{bar}\033[0m "
-            f"\033[37m{self.current}/{self.total}\033[0m "
-            f"\033[90m[{eta_str}]\033[0m",
-            end="",
-            flush=True,
-        )
-
-    def finish(self, msg: str = ""):
-        self.current = self.total
-        self._render()
-        print()  # newline
-        elapsed = time.time() - self._start_time
-        if msg:
-            _log(f"{msg} ({elapsed:.1f}s)", "ok")
-        else:
-            _log(f"完成 ({elapsed:.1f}s)", "ok")
+def _fail(msg: str) -> None:
+    print(f"[build]  FAIL {msg}", flush=True)
 
 
-# ══════════════════════════════════════════════
-# 构建步骤
-# ══════════════════════════════════════════════
+# ── 1. hiddenimports 自动扫描 ─────────────────────────────────────────
 
-def step_check_pyinstaller() -> bool:
-    """检查并安装 PyInstaller。"""
-    _log("检查 PyInstaller ...", "step")
-    try:
-        import PyInstaller  # noqa: F401
-        _log("PyInstaller 已就绪", "ok")
-        return True
-    except ImportError:
-        _log("PyInstaller 未安装，正在安装 ...", "warn")
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "pyinstaller",
-                 "--no-warn-script-location"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            _log("PyInstaller 安装完成", "ok")
-            return True
-        except subprocess.CalledProcessError:
-            _log("PyInstaller 安装失败，请手动执行: pip install pyinstaller", "error")
-            return False
+def collect_local_modules() -> list[str]:
+    """扫描 core/ 与 data/ 下全部 .py → 模块名(新增文件零维护)。"""
+    mods: set[str] = set()
+    for pkg in ("core", "data"):
+        for p in (PROJECT / pkg).rglob("*.py"):
+            if "__pycache__" in p.parts:
+                continue
+            mods.add(".".join(p.relative_to(PROJECT).with_suffix("").parts))
+    return sorted(mods)
 
 
-def step_clean():
-    """清理旧构建产物。"""
-    _log("清理旧构建 ...", "step")
-    for d in (DIST_DIR, BUILD_DIR):
-        if d.exists():
-            shutil.rmtree(d, ignore_errors=True)
-            _log(f"  已删除 {d.name}/", "info")
-    # 清理 .spec 文件
-    for spec in PROJECT_DIR.glob("*.spec"):
-        spec.unlink()
-        _log(f"  已删除 {spec.name}", "info")
-    _log("清理完成", "ok")
+# ── 2. datas 显式清单(白名单制) ──────────────────────────────────────
+
+def collect_datas() -> list[tuple[str, str]]:
+    """返回 (源路径, 包内目标目录) 清单。"""
+    datas: list[tuple[str, str]] = []
+
+    # assets/(字体 + 图标)整目录 → _internal/assets/
+    for p in sorted((PROJECT / "assets").rglob("*")):
+        if p.is_file():
+            datas.append((str(p), str(p.relative_to(PROJECT).parent)))
+
+    data_dir = PROJECT / "data"
+
+    # 顶层 json 模板(排除遗留/缓存)→ _internal/data/
+    for p in sorted(data_dir.glob("*.json")):
+        if p.name not in _DATA_JSON_EXCLUDE:
+            datas.append((str(p), "data"))
+
+    # 初始数据库(139MB,首启复制到用户目录)
+    datas.append((str(data_dir / "warframe.db"), "data"))
+
+    # 只读子目录:tokens 预设 + 世界状态节点翻译表
+    for sub in ("presets", "worldstate"):
+        for p in sorted((data_dir / sub).rglob("*")):
+            if p.is_file():
+                datas.append((str(p), f"data/{sub}"))
+
+    return datas
 
 
-def step_collect_datas() -> str:
-    """收集 --add-data 参数，返回 PyInstaller 参数列表。"""
-    args = []
-    missing = []
+# ── 3. PyInstaller 构建 ──────────────────────────────────────────────
 
-    for src, dst in DATA_DIRS:
-        src_path = PROJECT_DIR / src
-        if src_path.exists():
-            args.extend(["--add-data", f"{src_path};{dst}"])
-        else:
-            missing.append(src)
+def run_build(clean: bool) -> None:
+    mods = collect_local_modules()
+    datas = collect_datas()
+    _log(f"hiddenimports: {len(mods)} 个本地模块(自动扫描)")
+    _log(f"datas: {len(datas)} 个文件(显式清单)")
 
-    for src, dst in DATA_FILES:
-        src_path = PROJECT_DIR / src
-        if src_path.exists():
-            args.extend(["--add-data", f"{src_path};{dst}"])
-        else:
-            missing.append(src)
-
-    if missing:
-        _log(f"以下文件/目录不存在，已跳过: {', '.join(missing)}", "warn")
-
-    return args
-
-
-def step_build(no_console: bool = False):
-    """执行 PyInstaller 打包。"""
-    _log("开始 PyInstaller 打包 ...", "step")
-
-    # 收集数据文件参数
-    data_args = step_collect_datas()
-
-    # 构建 PyInstaller 命令
     cmd = [
         sys.executable, "-m", "PyInstaller",
-        "--onedir",
-        "--name", NAME,
-        "--distpath", str(DIST_DIR),
+        "--noconfirm",
+        "--distpath", str(DIST),
         "--workpath", str(BUILD_DIR),
-        "--specpath", str(PROJECT_DIR),
-        "--clean",
+        "--specpath", str(BUILD_DIR),   # spec 生成到 build/,不污染根目录
+        "--name", APP_NAME,
+        "--onedir",
+        "--windowed",                    # 用户决策:不显示 CMD 窗口
+        "--noupx",                       # 降低杀软误报
+        "--collect-all", "rapidocr_onnxruntime",  # OCR 模型随包
+        "--exclude-module", "PyQt5",     # 铁律:新旧 Qt 绝不混用
+        "--exclude-module", "PyQt6",
+        "--exclude-module", "tkinter",
+        "--paths", str(PROJECT),
     ]
-
-    if no_console:
-        cmd.append("--noconsole")
-        cmd.append("--windowed")
-
-    # 添加隐藏导入
-    for hi in HIDDEN_IMPORTS:
-        cmd.extend(["--hidden-import", hi])
-
-    # 收集整个包（含模型文件等非 Python 资源）
-    cmd.extend(["--collect-all", "rapidocr_onnxruntime"])
-
-    # 排除模块
-    for em in EXCLUDE_MODULES:
-        cmd.extend(["--exclude-module", em])
-
-    # 添加数据文件
-    cmd.extend(data_args)
-
-    # 收集 core 下所有子目录的 Python 文件
-    for subdir in ["pages", "services", "recognizers", "state", "tokens", "widgets"]:
-        sdir = PROJECT_DIR / "core" / subdir
-        if sdir.exists():
-            for py_file in sdir.glob("*.py"):
-                if py_file.stem != "__init__":
-                    cmd.extend(["--hidden-import", f"core.{subdir}.{py_file.stem}"])
-
-    # 入口文件
+    if clean:
+        cmd.append("--clean")
+    for m in mods:
+        cmd += ["--hiddenimport", m]
+    for src, dst in datas:
+        cmd += ["--add-data", f"{src};{dst}"]
     cmd.append(str(ENTRY))
 
-    _log(f"  输出目录: {DIST_DIR / NAME}", "info")
-    _log(f"  入口文件: {ENTRY.name}", "info")
-    _log(f"  no-console: {no_console}", "info")
-
-    # 启动 PyInstaller（实时输出）
-    print(f"\033[90m{'─' * 60}\033[0m", flush=True)
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=str(PROJECT_DIR),
+    _log("PyInstaller 运行中(完整输出见 build/pyinstaller.log)...")
+    t0 = time.time()
+    BUILD_DIR.mkdir(exist_ok=True)
+    log_file = BUILD_DIR / "pyinstaller.log"
+    with open(log_file, "w", encoding="utf-8") as f:
+        proc = subprocess.run(
+            cmd, stdout=f, stderr=subprocess.STDOUT, cwd=str(PROJECT),
         )
-
-        # 读取输出并过滤关键行
-        pyi_lines = []
-        last_info = ""
-        for line in proc.stdout:
-            line = line.rstrip()
-            pyi_lines.append(line)
-
-            # 过滤并格式化 PyInstaller 的关键信息
-            line_lower = line.lower()
-            if any(kw in line_lower for kw in [
-                "building", "analyzing", "processing", "collecting",
-                "copying", "info:", "warn", "error",
-            ]):
-                # 关键行高亮显示
-                if "info:" in line_lower:
-                    print(f"  \033[36m{line}\033[0m", flush=True)
-                elif "warn" in line_lower:
-                    print(f"  \033[33m{line}\033[0m", flush=True)
-                elif "error" in line_lower:
-                    print(f"  \033[31m{line}\033[0m", flush=True)
-                else:
-                    # 提取 PyInstaller 进度信息
-                    short = line[line.find("INFO:") + 5:].strip() if "INFO:" in line else line
-                    if short and short != last_info and len(short) < 120:
-                        print(f"  \033[90m{short}\033[0m", flush=True)
-                        last_info = short
-
-        proc.wait()
-        print(f"\033[90m{'─' * 60}\033[0m", flush=True)
-
-        if proc.returncode != 0:
-            _log(f"PyInstaller 打包失败 (exit code: {proc.returncode})", "error")
-            # 输出最后 20 行以便调试
-            _log("最后 20 行输出:", "warn")
-            for line in pyi_lines[-20:]:
-                print(f"    {line}", flush=True)
-            return False
-
-        _log("PyInstaller 打包完成", "ok")
-        return True
-
-    except FileNotFoundError:
-        _log("PyInstaller 未找到，请先安装: pip install pyinstaller", "error")
-        return False
+    if proc.returncode != 0:
+        _fail(f"PyInstaller 失败(exit={proc.returncode}),日志尾部:")
+        tail = log_file.read_text(encoding="utf-8", errors="replace")
+        for line in tail.splitlines()[-30:]:
+            print("    " + line, flush=True)
+        sys.exit(1)
+    _ok(f"PyInstaller 完成,耗时 {time.time() - t0:.0f}s")
 
 
-def step_verify():
-    """验证构建产物。"""
-    _log("验证构建产物 ...", "step")
-    exe = DIST_DIR / NAME / f"{NAME}.exe"
+# ── 4. 构建后自检 ────────────────────────────────────────────────────
 
-    if not exe.exists():
-        _log(f"可执行文件不存在: {exe}", "error")
-        return False
-
-    size_mb = exe.stat().st_size / (1024 * 1024)
-    dir_size = sum(
-        f.stat().st_size for f in (DIST_DIR / NAME).rglob("*") if f.is_file()
-    ) / (1024 * 1024)
-
-    _log(f"  可执行文件: {exe.name} ({size_mb:.1f} MB)", "info")
-    _log(f"  文件夹总大小: {dir_size:.1f} MB", "info")
-    _log(f"  输出路径: {exe}", "info")
-    _log("验证通过", "ok")
-    return True
+def self_check() -> tuple[list[str], int]:
+    """检查关键资源是否齐全。返回 (缺失项, 检查总数)。"""
+    checks = [
+        APP_DIR / f"{APP_NAME}.exe",
+        INTERNAL / "data" / "warframe.db",
+        INTERNAL / "data" / "pixel_font.json",
+        INTERNAL / "data" / "presets" / "cyberpunk.yaml",
+        INTERNAL / "data" / "worldstate" / "solNodes.json",
+        INTERNAL / "assets" / "fonts" / "Iceberg-Regular.ttf",
+        INTERNAL / "assets" / "icons" / "nav_toggles.svg",
+        INTERNAL / "PySide6",
+        INTERNAL / "rapidocr_onnxruntime",  # collect-all 产物(OCR 模型)
+    ]
+    missing = [str(c.relative_to(APP_DIR)) for c in checks if not c.exists()]
+    return missing, len(checks)
 
 
-def step_create_launcher():
-    """创建启动说明文件。"""
-    launcher = DIST_DIR / NAME / "启动.bat"
-    launcher.write_text(
-        f'@echo off\n'
-        f'start "" "{NAME}.exe" --once\n',
-        encoding="utf-8",
+def _dir_size_mb(p: Path) -> float:
+    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) / 1024 / 1024
+
+
+# ── 5. 冒烟测试 ──────────────────────────────────────────────────────
+
+def smoke() -> bool:
+    """启动 exe 观察 6 秒:存活且 stderr 无 traceback 才算通过。
+
+    注意: windowed 应用崩溃时 PyInstaller 会弹错误对话框,进程不会退出,
+    仅凭"进程存活"判断会假阳性 —— 必须同时检查 stderr 中的 traceback。
+    (父进程提供 PIPE 时 windowed 进程的 stderr 句柄有效,
+    PyInstaller 崩溃时会先把 traceback 写入 stderr 再弹框。)
+    """
+    exe = APP_DIR / f"{APP_NAME}.exe"
+    _log("冒烟测试: 启动 exe,观察 6 秒 ...")
+    proc = subprocess.Popen(
+        [str(exe)], cwd=str(APP_DIR),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
-    _log(f"  已创建启动脚本: {launcher.name}", "info")
+    try:
+        time.sleep(6)
+        alive = proc.poll() is None
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        # 子进程已终止,管道关闭,一次性读出缓冲内容
+        err = b""
+        if proc.stderr:
+            err = proc.stderr.read() or b""
+            proc.stderr.close()
+        if proc.stdout:
+            proc.stdout.close()
+
+    # 路径治理证据:首启应在 exe 旁生成用户 data/(数据库等模板复制)
+    if (APP_DIR / "data").exists():
+        _ok("路径治理生效: 首启已在 exe 旁生成 data/ 用户目录")
+    # 发行前清掉冒烟产生的用户数据,保持出厂干净
+    shutil.rmtree(APP_DIR / "data", ignore_errors=True)
+
+    if b"Traceback" in err:
+        _fail("冒烟测试发现崩溃 traceback(stderr 尾部):")
+        for line in err.decode("utf-8", errors="replace").splitlines()[-12:]:
+            print("    " + line, flush=True)
+        return False
+    return alive
 
 
-# ══════════════════════════════════════════════
-# 主流程
-# ══════════════════════════════════════════════
+# ── 6. 发行 ZIP ──────────────────────────────────────────────────────
 
-def main():
-    args = sys.argv[1:]
-    do_clean = "--clean" in args
-    no_console = "--no-console" in args
+def make_zip() -> Path:
+    stamp = time.strftime("%Y%m%d")
+    base = DIST / f"{APP_NAME}_win64_{stamp}"
+    _log(f"生成 ZIP: {base.name}.zip ...")
+    shutil.make_archive(str(base), "zip", root_dir=DIST, base_dir=APP_NAME)
+    return base.with_suffix(".zip")
 
-    print()
-    print(f"\033[36m╔{'═' * 58}╗\033[0m")
-    print(f"\033[36m║\033[0m  \033[1;37mWARFRAME-RELIC  打包脚本\033[0m" + " " * 32 + "\033[36m║\033[0m")
-    print(f"\033[36m║\033[0m  PyInstaller onedir" + " " * 39 + "\033[36m║\033[0m")
-    print(f"\033[36m╚{'═' * 58}╝\033[0m")
-    print()
 
-    # ── 步骤 1: 检查 PyInstaller ──
-    if not step_check_pyinstaller():
+# ── main ─────────────────────────────────────────────────────────────
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="WARFRAME-RELIC 一键打包")
+    ap.add_argument("--zip", action="store_true", help="构建后生成发行 ZIP")
+    ap.add_argument("--no-smoke", action="store_true", help="跳过冒烟测试")
+    ap.add_argument("--no-clean", action="store_true", help="复用 PyInstaller 缓存")
+    args = ap.parse_args()
+
+    if not ENTRY.exists():
+        _fail(f"入口不存在: {ENTRY}")
         sys.exit(1)
 
-    # ── 步骤 2: 清理 ──
-    if do_clean:
-        step_clean()
-    else:
-        _log("跳过清理（使用 --clean 可强制清理）", "info")
+    _log("=" * 50)
+    _log("WARFRAME-RELIC 打包开始(onedir + windowed)")
+    _log("=" * 50)
 
-    # ── 步骤 3: 打包 ──
-    overall_start = time.time()
+    run_build(clean=not args.no_clean)
 
-    if not step_build(no_console=no_console):
+    missing, total = self_check()
+    if missing:
+        _fail(f"自检缺项 {len(missing)}/{total}:")
+        for m in missing:
+            print("    - " + m, flush=True)
         sys.exit(1)
+    _ok(f"自检通过({total} 项关键资源齐全)")
 
-    # ── 步骤 4: 创建启动脚本 ──
-    step_create_launcher()
+    _ok(f"产物: {APP_DIR}  ({_dir_size_mb(APP_DIR):.0f} MB)")
 
-    # ── 步骤 5: 验证 ──
-    if not step_verify():
-        sys.exit(1)
+    if not args.no_smoke:
+        if smoke():
+            _ok("冒烟测试通过(6 秒未闪退)")
+        else:
+            _fail("冒烟测试失败: 进程提前退出(疑似缺依赖闪退)")
+            sys.exit(1)
 
-    # ── 完成 ──
-    overall = time.time() - overall_start
-    print()
-    print(f"\033[32m{'═' * 60}\033[0m")
-    print(f"\033[1;32m  打包成功! 耗时 {overall:.1f}s\033[0m")
-    print(f"\033[32m  输出: {DIST_DIR / NAME}\033[0m")
-    print(f"\033[32m  启动: {DIST_DIR / NAME / f'{NAME}.exe'} --once\033[0m")
-    print(f"\033[32m{'═' * 60}\033[0m")
-    print()
+    if args.zip:
+        z = make_zip()
+        _ok(f"ZIP 完成: {z.name}  ({z.stat().st_size / 1024 / 1024:.0f} MB)")
+
+    _log("全部完成")
 
 
 if __name__ == "__main__":

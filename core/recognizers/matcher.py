@@ -1,14 +1,33 @@
 """
-独立物品匹配引擎
+[L-Recognizer] Matcher — 独立物品匹配引擎
 
-将 match_and_price / match_and_translate 的公共匹配逻辑抽取为 match_items()，
-消除 80% 重复代码。两个公开函数变为薄封装。
+依赖: sqlite3(读 warframe.db / prime_parts)
+被谁用: core.services.screenshot_pipeline.match_and_price
+
+将 match_and_price 的公共匹配逻辑抽取为 match_items()。
+
 
 匹配策略（4 轮降级）:
   1. 精确匹配 en_name
   2. 模糊匹配（单词合理性验证）
   3. 纠错候选逐个尝试
   4. 部件蓝图直通（本地 DB 无部件数据，直接查 WM API）
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L-Recognizer] (core/recognizers/)
+允许依赖:  numpy, onnxruntime, opencv-python, sqlite3, rapidocr-onnxruntime
+禁止依赖:  core.widgets/* / core.pages/* / core.state/*
+           (不能调 UI,只能输出结构化结果)
+必读规范:  .trae/rules/开发规范.md §6.3
+
+本文件相关红线:
+- 禁止返回 Qt 控件 → 只能返回 dict(含 en_name / zh_name / slug / quality)
+- 禁止阻塞主线程的长任务 → 必须放 QThread/Signal
+- 禁止吞掉 OCR 错误 → 必须 try/except 记录到日志
+- 禁止在 OCR 链路里调网络 API → OCR 是离线识别
+- 禁止 import 整个 core.* → 只 import 同层 (recognizers) 模块
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.3。
 """
 
 from typing import Optional
@@ -16,6 +35,10 @@ from data.item_index import search_items
 import sqlite3
 import os
 import re
+
+# 数据库路径(打包/开发环境自适应,见 core.paths)
+from core.paths import ensure_user_file as _ensure_user_file
+_DB_PATH = _ensure_user_file("warframe.db")
 
 
 # ============================================================
@@ -28,6 +51,10 @@ _PART_SUFFIXES = [
     'Head', 'Guard', 'String', 'Lower Limb', 'Upper Limb',
     'Chassis', 'Systems', 'Neuroptics',
     'Carapace', 'Cerebrum',  # 守护部件
+    # 稀有部件（Kavasa 项圈、Archwing 等）
+    'Band', 'Buckle', 'Hilt', 'Boot', 'Chain', 'Disc',
+    'Ornament', 'Pouch', 'Stars', 'Wings', 'Harness',
+    'Gauntlet', 'Cerebrum', 'Blades',
 ]
 
 
@@ -75,7 +102,7 @@ def _upsert_part_to_db(item: dict) -> None:
         return
 
     try:
-        db_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data')
+        db_dir = str(_DB_PATH.parent)
         db_path = os.path.join(db_dir, 'warframe.db')
         if not os.path.exists(db_path):
             return
@@ -136,6 +163,32 @@ def _split_camel_case(text: str) -> str:
     return text
 
 
+def _lookup_prime_slug(en_name: str) -> Optional[str]:
+    """从 warframe.db prime_parts 表精确查询 slug。
+
+    Returns:
+        slug 字符串（如 "ash_prime_neuroptics_blueprint"），或 None。
+    """
+    if not en_name:
+        return None
+    try:
+        db_dir = str(_DB_PATH.parent)
+        db_path = os.path.join(db_dir, 'warframe.db')
+        if not os.path.exists(db_path):
+            return None
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT slug FROM prime_parts WHERE en_name = ?", (en_name,)
+        ).fetchone()
+        conn.close()
+        if row and row['slug']:
+            return row['slug']
+    except Exception as e:
+        print(f"[prime-slug] 查询失败: {e}", flush=True)
+    return None
+
+
 def _is_part_prime_only(en_name: str) -> bool:
     """检查部件直通名称的基础名是否只有 Prime 变体可交易。
 
@@ -154,7 +207,7 @@ def _is_part_prime_only(en_name: str) -> bool:
     try:
         import sqlite3
 
-        db_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data')
+        db_dir = str(_DB_PATH.parent)
         db_path = os.path.join(db_dir, 'warframe.db')
         if not os.path.exists(db_path):
             return False
@@ -300,11 +353,20 @@ def _match_one_item(
             best_name = _insert_prime_before_part(best_name)
             print(f"[匹配-部件直通] 自动补全 Prime: \"{ocr_text}\" -> \"{best_name}\"", flush=True)
 
+        # ★ 利用 prime_parts 数据库纠错 slug
+        # prime_parts 的 slug 来自 Relics.json warframeMarket.urlName（数据源100%可信），
+        # 比 _name_to_slug 规则计算更准确（覆盖了"receiver→reciever"等WM拼写异常）
+        prime_slug = _lookup_prime_slug(best_name)
+        if prime_slug:
+            print(f"[匹配-部件直通] prime_parts 命中 slug: \"{best_name}\" -> \"{prime_slug}\"", flush=True)
+
         matched = {
             'en_name': best_name,
             'zh_name': _en_part_to_cn(best_name),
             'category': 'Warframe Parts',
         }
+        if prime_slug:
+            matched['slug'] = prime_slug
         match_quality = 'part_direct'
         print(f"[匹配-部件直通] [ok] \"{best_name}\" -> zh=\"{matched['zh_name']}\"", flush=True)
 
@@ -593,11 +655,4 @@ def match_and_price(
     return svc.query_prices_batch(filtered)
 
 
-def match_and_translate(
-    recognized: list[tuple[str, list, list[str]]]
-) -> list[dict]:
-    """将识别到的英文名匹配翻译为中文（不含价格查询）。
 
-    直接使用 match_items()，仅日志前缀不同。
-    """
-    return match_items(recognized)

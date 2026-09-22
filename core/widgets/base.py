@@ -1,14 +1,18 @@
 """
-Cyber Widget 基础设施 — CyberWidgetMixin。
+[L4] core.widgets.base — Cyber Widget 基础设施 CyberWidgetMixin
 
-赛博风格 UI 组件的混入基类，提供：
-- Token 访问接口（token / space）
-- 交互状态机（normal/hover/pressed/focused/disabled/selected）
-- 切角路径生成（带缓存）
-- 自绘背景方法（切角 + 外发光）
+继承: 无(Qt 原生控件的多重继承 Mixin)
+依赖: core.tokens.manager (只此一个外部)
+职责: 切角绘制 + 状态机 + Token 访问接口
 
-设计原则（Mixin 模式）:
-    本类不继承 QWidget，不能单独实例化。
+赛博风格 UI 组件的混入基类,提供:
+- Token 访问接口(token / space)
+- 交互状态机(normal/hover/pressed/focused/disabled/selected)
+- 切角路径生成(带缓存)
+- 自绘背景方法(切角 + 外发光)
+
+设计原则(Mixin 模式):
+    本类不继承 QWidget,不能单独实例化。
     使用时通过多重继承与 Qt 原生控件组合::
 
         class CyberButton(CyberWidgetMixin, QPushButton):
@@ -16,28 +20,57 @@ Cyber Widget 基础设施 — CyberWidgetMixin。
                 QPushButton.__init__(self, text, parent)  # 显式调用目标基类
                 # ... CyberWidgetMixin 无需 __init__
 
-使用方式::
-
-    class MyPanel(CyberWidgetMixin, QFrame):
-        def paintEvent(self, event):
-            painter = QPainter(self)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            self._draw_chamfered_bg(painter)
-            # QFrame 无自身绘制内容，无需 super()
+        class MyPanel(CyberWidgetMixin, QFrame):
+            def paintEvent(self, event):
+                painter = QPainter(self)
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                self._draw_chamfered_bg(painter)
+                # QFrame 无自身绘制内容,无需 super()
 
 See Also:
     ui-framework-design.md §5.2 Cyber Widget 框架 — Mixin 设计模式
     ui-framework-design.md 附录 B: 多重继承注意事项
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L4] (core/widgets/)
+允许依赖:  core.tokens.manager (唯一外部依赖)
+禁止依赖:  core.services/* / core.pages/* / core.state/* / data/*
+           (Mixin 是 UI 基础设施,绝不调业务)
+必读规范:  .trae/rules/开发规范.md §6.4 (L4/L5 控件层)
+
+本文件相关红线(出自规范自查卡):
+- ✗ 禁止: __init__ 用 super().__init__() → 必须显式 Qxxx.__init__(self, ...)
+- ✗ 禁止: paintEvent 里忘记 super() → 文字/快捷键会失效
+- ✗ 禁止: paintEvent 顺序写反 → 必须 QPainter → 自绘 → super()
+- ✗ 禁止: 写死颜色 "#FF0000" / 尺寸 26 → 必须 self.token() / self.space()
+- ✗ 禁止: 私有属性用 _xxx 命名 → 必须 _cyber_xxx 前缀(避免与 Qt 内部冲突)
+- ✗ 禁止: 调 Service 或发网络请求 → Widget 只绘制和发信号
+
+写入/修改前自检:
+- [ ] 颜色/尺寸都从 token/space 取,无硬编码
+- [ ] 私有属性加 _cyber_ 前缀
+- [ ] paintEvent 顺序: QPainter → 自绘 → super()
+- [ ] 事件处理函数末尾都 super()
+- [ ] 没引入 services/ 或 data/ 的 import
+
+OPTIONS:
+如对 Mixin 多重继承有疑义,先读 ui-framework-design.md §5.2,
+再开始改动,不要"走捷径"调 super()。
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from PySide6.QtWidgets import QWidget
     from PySide6.QtGui import QPainter, QColor
     from PySide6.QtCore import QPointF, QRectF, Qt
+
+
+# Widget 层统一日志器（token 缺失等降级场景告警用）
+_cyber_logger = logging.getLogger("core.widgets")
 
 
 class CyberWidgetMixin:
@@ -59,11 +92,143 @@ class CyberWidgetMixin:
     _path_cache: Optional[object] = None  # QPolygonF 实例
     _cache_rect_size: Optional[tuple] = None
 
-    # ══════════════════════════════════════════════
+    # ── 全局沉浸模式（类级；由 AppShell 经 set_immersive_global 设置）──
+    # 类级保证：页面懒创建的新卡片也自动继承当前沉浸状态
+    _cyber_immersive: bool = False
+    _cyber_immersive_strength: int = 70  # 0-100，越大底色越透
+    # 沉浸底色预设覆写色（None=沿用 token 当前主题底色；非 None=覆写 RGB）
+    _cyber_immersive_color_override: Optional[object] = None  # QColor 实例
+
+    @classmethod
+    def set_immersive_global(cls, enabled: bool, strength: int = 70) -> None:
+        """设置全局沉浸模式状态（控件层只存状态、不订阅业务）。
+
+        Args:
+            enabled: 是否开启沉浸
+            strength: 沉浸强度 0-100（底色折减比例；100=底色全透）
+        """
+        cls._cyber_immersive = bool(enabled)
+        cls._cyber_immersive_strength = max(0, min(100, int(strength)))
+
+    @classmethod
+    def set_immersive_color_mode(cls, mode: str) -> None:
+        """设置沉浸模式卡片底色预设（控件层只存状态、不订阅业务）。
+
+        Args:
+            mode: "theme"=沿用 token 当前主题底色(默认,覆写为 None)
+                  "black"=沉浸时覆写为纯黑(用 surface.overlay token,失败纯黑兜底)
+        """
+        if mode == "black":
+            from PySide6.QtGui import QColor
+            c = QColor(0, 0, 0)
+            try:
+                from core.tokens.manager import TokenManager
+                v = TokenManager.instance().get("surface.overlay")
+                if v:
+                    tc = QColor(str(v))
+                    if tc.isValid():
+                        c = tc
+            except Exception:
+                pass
+            cls._cyber_immersive_color_override = c
+        else:
+            cls._cyber_immersive_color_override = None
+
+    def _cyber_immersive_alpha(self, normal_alpha: float) -> float:
+        """底色 alpha 折减：非沉浸原值返回；沉浸时按强度保留剩余比例。
+
+        例：normal=0.85、strength=70 → 0.85×0.3 ≈ 0.26。
+        """
+        if not self._cyber_immersive:
+            return normal_alpha
+        from core.widgets import immersive
+        return immersive.alpha_factor(normal_alpha)
+
+    def _cyber_immersive_resolve_bg(self, key: str, alpha: float) -> "QColor":
+        """从 token 取底色 → 沉浸黑色模式时覆写 RGB(保留 alpha) → 折减 alpha。
+
+        统一入口,供 CyberCard/CyberPanel 的 paintEvent 调用。
+        计算实现收敛在 core/widgets/immersive.py(唯一实现),本方法
+        只保留 Mixin API 形态,内部转发。
+
+        Args:
+            key: 颜色 token 路径(如 "components.card.bg")
+            alpha: 非沉浸时的目标 alpha(如 0.85)
+
+        Returns:
+            最终 QColor(已应用覆写和 alpha 折减)
+        """
+        from core.widgets import immersive
+        return immersive.resolve_qcolor(self.token_color(key), alpha)
+
+    def _cyber_resolve_nav_bg_color(self, fallback_str: str) -> "QColor":
+        """导航标签底色:沉浸黑色模式时覆写 RGB,保留默认 alpha=255。
+
+        与 _cyber_immersive_resolve_bg 区别:nav.bg 取自字符串(可来自
+        theme_proxy 兜底),不做 alpha 折减(折减由调用方后续 setAlphaF)。
+
+        Args:
+            fallback_str: 原始 token 解析出的颜色字符串
+
+        Returns:
+            QColor(沉浸黑色模式时为纯黑,否则为原色)
+        """
+        from PySide6.QtGui import QColor
+        from core.widgets import immersive
+        return immersive.override_rgb(QColor(fallback_str))
+
+    def _cyber_immersive_resolve_token_str(
+        self,
+        key: str,
+        alpha: float = 1.0,
+    ) -> str:
+        """QSS 字符串入口:沉浸黑色模式时返回覆写后的颜色 hex 字符串。
+
+        与 ``_cyber_immersive_resolve_bg`` 对应(QColor 路径用于 paintEvent,
+        本方法字符串路径用于 QSS setStyleSheet)。实现收敛在
+        core/widgets/immersive.py,本方法只保留 Mixin API 形态。
+
+        Args:
+            key: 颜色 token 路径(如 ``alias.bg.base``)
+            alpha: 非沉浸时的目标 alpha(如 0.85)
+
+        Returns:
+            QSS 可直接拼接的颜色字符串(``#AARRGGBB``)
+        """
+        from PySide6.QtGui import QColor
+        from core.widgets import immersive
+        # 走 token_color(带三级兜底,不抛异常),再进沉浸覆写
+        return immersive.resolve_qcolor(
+            self.token_color(key), alpha
+        ).name(QColor.NameFormat.HexArgb)
+
+    def _cyber_immersive_resolve_bg_qcolor(
+        self,
+        qcolor: "QColor",
+        alpha: float,
+    ) -> "QColor":
+        """QColor 路径入口:沉浸黑色模式时覆写 RGB,折减 alpha。
+
+        与 ``_cyber_immersive_resolve_bg`` 区别:本方法接受调用方已取好的
+        QColor(适合有 try/except 兜底逻辑、或多 token 切换的场景,如
+        CyberLineEdit / CyberComboBox / HotkeyEdit 的状态机)。
+        实现收敛在 core/widgets/immersive.py。
+
+        Args:
+            qcolor: 调用方已用 token_color(...) 取好的 QColor
+            alpha: 非沉浸时的目标 alpha(如 0.85)
+
+        Returns:
+            最终 QColor(已应用 RGB 覆写和 alpha 折减)
+        """
+        from core.widgets import immersive
+        return immersive.resolve_qcolor(qcolor, alpha)
+
+    # ════════════════════════════════════════════════
     #  Token 访问接口
     # ══════════════════════════════════════════════
 
-    def token(self, key: str) -> str:
+    def token(self, key: str, default: Optional[str] = None) -> str:
         """获取颜色/样式 token 的字符串值。
 
         这是组件内部获取 token 的主要方式。
@@ -72,45 +237,87 @@ class CyberWidgetMixin:
         Args:
             key: 点分路径，如 "bg.raised"、"accent.primary"、
                  "components.button.solid.fill"
+            default: key 不存在时的兜底字符串（不给则按 TokenManager
+                     默认行为抛出 TokenResolveError）
 
         Returns:
             解析后的字符串值（如 "#0E0E24"、"transparent"）
 
         Note:
-            如果需要 QColor 对象，请使用 token_color() 方法。
+            如果需要 QColor 对象，请使用 token_color() 方法
+            （该方法内置完整降级保护，永不抛异常）。
         """
         from core.tokens.manager import TokenManager
         tm = TokenManager.instance()
-        result = tm.get(key)
+        result = tm.get(key, default=default) if default is not None else tm.get(key)
         if isinstance(result, str):
             return result
         return str(result)
 
-    def token_color(self, key: str) -> "QColor":
-        """获取颜色 token 并返回 QColor 对象。
+    def token_color(
+        self,
+        key: str,
+        default: "Optional[QColor | str]" = None,
+    ) -> "QColor":
+        """获取颜色 token 并返回 QColor 对象（防御性，永不抛异常）。
 
-        便捷方法，省去手动 parse 的步骤。
+        降级保证：key 不存在、解析失败或颜色串非法时，绘制不会中断
+        （避免出现"控件整块不显示"），按以下顺序回退：
+
+        1. 调用方提供的 ``default``（QColor 或颜色字符串）；
+        2. 已知必然存在的安全 token ``alias.bg.raised``；
+        3. 纯黑 ``QColor(0, 0, 0)``。
+
+        每次降级都会通过 ``core.widgets`` 日志器输出 warning，
+        便于在控制台发现 token 配置问题。
 
         Args:
             key: 颜色 token 路径
+            default: 可选兜底色
 
         Returns:
-            QColor 实例
+            QColor 实例（始终有效）
         """
         from PySide6.QtGui import QColor
         from core.tokens.manager import TokenManager
 
-        value = TokenManager.instance().get(key)
+        def _fallback(reason: str) -> "QColor":
+            _cyber_logger.warning(
+                "token_color 取色失败 key=%s (%s)，已使用兜底色", key, reason
+            )
+            if default is not None:
+                try:
+                    c = QColor(default) if isinstance(default, str) else QColor(default)
+                    if c.isValid():
+                        return c
+                except Exception:
+                    pass
+            # 兜底链：已知存在的安全 token → 纯黑
+            try:
+                c = QColor(TokenManager.instance().get("alias.bg.raised"))
+                if c.isValid():
+                    return c
+            except Exception:
+                pass
+            return QColor(0, 0, 0)
 
-        if isinstance(value, str):
-            if value.lower() == "transparent":
-                return QColor(0, 0, 0, 0)
-            return QColor(value)
+        try:
+            value = TokenManager.instance().get(key)
 
-        if isinstance(value, (int, float)):
-            return QColor(int(value), int(value), int(value))
+            if isinstance(value, str):
+                if value.lower() == "transparent":
+                    return QColor(0, 0, 0, 0)
+                c = QColor(value)
+                return c if c.isValid() else _fallback("非法颜色字符串")
 
-        return QColor(value)
+            if isinstance(value, (int, float)):
+                v = max(0, min(255, int(value)))
+                return QColor(v, v, v)
+
+            c = QColor(value)
+            return c if c.isValid() else _fallback("非法颜色值")
+        except Exception as exc:
+            return _fallback(str(exc))
 
     def space(self, key: str, default: int = 0) -> int:
         """获取空间尺寸 token 的整数值。
@@ -352,7 +559,7 @@ class CyberWidgetMixin:
             selected: 是否为选中态（选中时左侧竖条加宽高亮 + 反色虚影）
             hover: 是否为悬停态（hover 时背景提亮）
         """
-        from PySide6.QtGui import QColor, QPen, QBrush, QPainterPath, QLinearGradient
+        from PySide6.QtGui import QColor, QPen, QBrush, QPainterPath
         from PySide6.QtCore import QPointF, QRectF, Qt
         from core.tokens.manager import TokenManager
 
@@ -365,18 +572,25 @@ class CyberWidgetMixin:
         corner_br = tm.space("nav.corner_br", 6)
         inner_pad = tm.space("nav.inner_pad", 16)
 
-        border_color_str = tm.get("nav.border", "#00FFFF")
-        bg_color_str = tm.get("nav.bg", "#0A1628")
-        bar_color_str = tm.get("nav.bar", "#00FFFF")
-        bar_selected_color_str = tm.get("nav.bar_selected", "#00FFFF")
-        text_color_str = tm.get("nav.text", "#E8ECFF")
+        # 全部从 token 取;若 token 未配置则用 theme_proxy 常量兜底
+        # theme_proxy 自身零硬编码,所以本段没有引入任何 F1 硬编码颜色
+        # 兜底选择:
+        #   - nav.border / nav.bar 默认用 CYBER_CYAN(青色,与品牌强调色区分)
+        #   - nav.bg / nav.text 用 LIGHT_TEXT(主文字色,白系)
+        # 这些兜底仅在 token 缺失时生效,正常 token 加载后会被覆盖
+        from core.theme_proxy import LIGHT_TEXT, CYBER_CYAN
+        border_color_str = tm.get("nav.border") or str(CYBER_CYAN)
+        bg_color_str = tm.get("nav.bg") or str(LIGHT_TEXT)
+        bar_color_str = tm.get("nav.bar") or str(CYBER_CYAN)
+        bar_selected_color_str = tm.get("nav.bar_selected") or str(CYBER_CYAN)
+        text_color_str = tm.get("nav.text") or str(LIGHT_TEXT)
         # 选中态反色虚影参数
         glow_enabled = bool(tm.get("nav.glow.enabled", True))
         glow_spread = int(tm.space("nav.glow.spread", 6))
         glow_alpha = float(tm.get("nav.glow.alpha", 0.25))
 
         border_color = QColor(border_color_str)
-        bg_color = QColor(bg_color_str)
+        bg_color = self._cyber_resolve_nav_bg_color(bg_color_str)
         bar_color = QColor(bar_color_str)
         bar_sel_color = QColor(bar_selected_color_str)
         text_color = QColor(text_color_str)
@@ -464,6 +678,8 @@ class CyberWidgetMixin:
             bg_color.setHslF(h, s, min(l + 0.08, 1.0))
         else:
             bg_color.setAlphaF(0.75)
+        # 沉浸模式：按强度折减主内容区底色（装饰竖条/文字/边框不折减）
+        bg_color.setAlphaF(self._cyber_immersive_alpha(bg_color.alphaF()))
         painter.fillPath(main_path, QBrush(bg_color))
 
         # ── 3. 边框描边（选中+hover 增强发光）──
@@ -529,7 +745,11 @@ class CyberWidgetMixin:
 
         spacing = int(tm.space("scanline.spacing", 2))      # 横纹间距（像素）
         line_alpha = float(tm.get("scanline.alpha", 0.06))   # 横纹透明度 [0,1]
-        color_str = str(tm.get("scanline.color", "#000000"))
+        # scanline.color 取自 token;若未配置则用 LIGHT_TEXT 兜底
+        # 扫描线颜色一般取主文字色(浅色),与暗色背景形成对比
+        # theme_proxy.LIGHT_TEXT 自身零硬编码,兜底不引入新 F1
+        from core.theme_proxy import LIGHT_TEXT
+        color_str = str(tm.get("scanline.color") or LIGHT_TEXT)
 
         if spacing < 1:
             return

@@ -1,10 +1,14 @@
 """
-CyberRelicTooltip — 赛博风格遗物信息悬浮窗。
+[L4] CyberRelicTooltip — 赛博风格遗物信息悬浮窗
 
-鼠标悬停在遗物条目上时弹出的详细信息面板，展示：
-- 标题栏：遗物名称 + 入库状态
-- 遗物内含物品：按稀有度着色（金/银/铜）+ 掉落概率
-- 掉落来源：按来源类型分组（任务/赏金等）
+继承: CyberWidgetMixin + QFrame
+依赖: core.tokens.manager + data/ 模块
+职责: 鼠标悬停展示遗物内含物品(按稀有度着色)+ 掉落来源分组
+
+鼠标悬停在遗物条目上时弹出的详细信息面板，展示:
+- 标题栏: 遗物名称 + 入库状态
+- 遗物内含物品: 按稀有度着色(金/银/铜) + 掉落概率
+- 掉落来源: 按来源类型分组(任务/赏金等)
 
 数据结构::
 
@@ -29,6 +33,22 @@ CyberRelicTooltip — 赛博风格遗物信息悬浮窗。
     tip = CyberRelicTooltip()
     tip.set_data(relic_info=relic_info, sources=sources)
     tip.show_at(widget, pos)
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L4] (core/widgets/)
+允许依赖:  core.widgets.base.CyberWidgetMixin, core.tokens.manager, PySide6, data/ (只读)
+禁止依赖:  core.services/*, core.pages/*, core.state/*
+           (Tooltip 只展示静态数据,绝不调业务)
+必读规范:  .trae/rules/开发规范.md §6.4
+
+本文件相关红线:
+- ✗ 禁止 __init__ 调 super().__init__() → 必须 QFrame.__init__(self, parent)
+- ✗ 禁止 paintEvent 漏 super() → 文字/稀有度色块会失效
+- ✗ 禁止硬编码稀有度颜色 → 必须从 data/ 读取或 token 取
+- ✗ 禁止 tooltip 内启动 QTimer/QThread 主动请求数据 → 必须外部 set_data() 喂入
+- ✗ 禁止调 Service / 发网络请求
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.4。
 """
 
 from __future__ import annotations

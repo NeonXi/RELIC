@@ -1,19 +1,39 @@
 """
-[L2] 物品查询页面 — 完整功能实现
+[L2] ItemsPage — 物品查询页面
+
+依赖: widgets/, services/item_service.py
+职责: 关键词搜索物品,显示掉落来源,支持复制/悬停预览
 
 功能:
-  - 关键词搜索（中/英/拼音联想）
-  - 搜索结果列表展示（含稀有度、分类标签）
-  - 悬停悬浮窗显示掉落途径（自动中文化）
+  - 关键词搜索(中/英/拼音联想)
+  - 搜索结果列表展示(含稀有度、分类标签)
+  - 悬停悬浮窗显示掉落途径(自动中文化)
   - 双击复制物品名称到剪贴板
   - 数据库状态检测与提示
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L2] (core/pages/)
+允许依赖:  core.widgets/*, core.services.item_service, PySide6
+禁止依赖:  core.tokens/* 直接调用(只能间接)
+           任何反向依赖 widgets(Widget 不能调本 Page)
+必读规范:  .trae/rules/开发规范.md §6.5
+
+本文件相关红线:
+- ✗ 禁止 setStyleSheet(f"...") → 必须用 Token 或继承自 CyberWidget
+- ✗ 禁止重写 paintEvent → 视觉交给 Widget
+- ✗ 禁止直接读写 JSON / 调网络 → 走 item_service.get()
+- ✗ 禁止直接持有并修改另一个 Page → 走 EventBus
+- ✗ 禁止硬编码颜色 / 尺寸 → 必须 token / space
+- ✗ 禁止搜索逻辑在 Page 内实现 → 走 Service.search()
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.5。
 """
 
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QFrame, QSizePolicy,
+    QFrame, QSizePolicy, QScrollArea,
     QListWidget, QListWidgetItem,
 )
 from PySide6.QtCore import Qt, QTimer, QPoint
@@ -76,6 +96,7 @@ class ItemsPage(PageBase):
         self._suggest_timer.timeout.connect(self._on_suggest_trigger)
 
     def build_content(self) -> QWidget:
+        """构建物品查询页(搜索框 + 结果列表 + 详情面板)。"""
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(
@@ -87,17 +108,22 @@ class ItemsPage(PageBase):
         # ── 标题 ──
         title = QLabel(self._copy("items.title", "物品检索"))
         title.setFont(QFont("Iceberg", self._font_size("lg_xl", 18)))
-        accent = self._color("accent.primary")
-        title.setStyleSheet(f"color: {accent}; padding: {self._spacing('spacing.xs', 4)}px 0;")
+        self._style(
+            title,
+            color="accent.primary",
+            padding=(f"{self._spacing('spacing.xs', 4)}px", "0"),
+        )
         layout.addWidget(title)
 
         desc = QLabel(
             self._copy("items.desc",
                        "搜索遗物内含物品、Prime 部件、蓝图等，支持中文/英文/拼音")
         )
-        desc.setStyleSheet(
-            f"color: {self._color('text.tertiary')}; "
-            f"font-size: {self._font_size('sm', 12)}px; padding: 0 0 12px 0;"
+        self._style(
+            desc,
+            color="text.tertiary",
+            font_size="sm",
+            padding=("0", "0", "12px", "0"),
         )
         layout.addWidget(desc)
 
@@ -113,9 +139,10 @@ class ItemsPage(PageBase):
         # 搜索输入行
         search_row = QHBoxLayout()
         search_label = QLabel(self._copy("items.label_keyword", "关键词:"))
-        search_label.setStyleSheet(
-            f"color: {self._color('text.secondary')}; "
-            f"font-size: {self._font_size('sm_md', 13)}px;"
+        self._style(
+            search_label,
+            color="text.secondary",
+            font_size="sm_md",
         )
         search_label.setFixedWidth(self._spacing("label_w", 60))
         search_row.addWidget(search_label)
@@ -132,13 +159,39 @@ class ItemsPage(PageBase):
 
         layout.addWidget(search_card)
 
-        # ── 结果统计栏 ──
+        # ── 结果统计栏 + 复制 toast ──
         self._stats_bar = QLabel("")
-        self._stats_bar.setStyleSheet(
-            f"color: {self._color('text.tertiary')}; "
-            f"font-size: {self._font_size('xs', 11)}px; padding: {self._spacing('spacing.none', 0)}px 0;"
+        self._style(
+            self._stats_bar,
+            color="text.tertiary",
+            font_size="xs",
+            padding=(f"{self._spacing('spacing.none', 0)}px", "0"),
         )
-        layout.addWidget(self._stats_bar)
+        # 复制成功提示(toast):默认隐藏,2 秒后自动清空
+        self._copy_toast = QLabel("")
+        self._copy_toast.setStyleSheet(
+            f"color: {self._color('semantic.success')};"
+            f"font-size: {self._font_size('xs', 11)}px;"
+            f"font-weight: bold;"
+            f"background: transparent;"
+            f"border: none;"
+        )
+        self._copy_toast.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._copy_toast.hide()
+        # 复制 toast 定时器(2 秒后自动清空,无副作用)
+        self._copy_toast_timer = QTimer(self)
+        self._copy_toast_timer.setSingleShot(True)
+        self._copy_toast_timer.setInterval(2000)
+        self._copy_toast_timer.timeout.connect(lambda: self._copy_toast.clear() or self._copy_toast.hide())
+
+        # 同一行:左边统计,右边 toast
+        stats_row = QHBoxLayout()
+        stats_row.setContentsMargins(0, 0, 0, 0)
+        stats_row.setSpacing(self._spacing("sm", 8))
+        stats_row.addWidget(self._stats_bar)
+        stats_row.addStretch()
+        stats_row.addWidget(self._copy_toast)
+        layout.addLayout(stats_row)
 
         # ── 搜索结果区域 ──
         result_card = CyberCard(title=self._copy("items.card_result", "搜索结果"))
@@ -158,6 +211,7 @@ class ItemsPage(PageBase):
         self._result_list.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        self._result_list.itemClicked.connect(self._on_item_clicked)
         self._result_list.itemDoubleClicked.connect(self._on_item_double_clicked)
         self._result_list.setMouseTracking(True)
         self._result_list.itemEntered.connect(self._on_item_hovered)
@@ -167,27 +221,35 @@ class ItemsPage(PageBase):
         list_bg_hover = self._color("components.list_item.bg_hover")
         accent = self._color("accent.primary")
 
-        self._result_list.setStyleSheet(f"""
-            QListWidget {{
-                background-color: transparent;
-                border: none;
-                outline: none;
-                font-size: {self._font_size('sm_md', 13)}px;
-            }}
-            QListWidget::item {{
-                color: {self._color('text.primary')};
-                padding: {self._spacing('spacing.sm', 8)}px {self._spacing('spacing.md', 12)}px;
-                border-bottom: 1px solid {self._BORDER_SUBTLE};
-                border-radius: {self._spacing('corner.xs', 4)}px;
-            }}
-            QListWidget::item:selected {{
-                background-color: {list_bg_hover};
-                color: {accent};
-            }}
-            QListWidget::item:hover {{
-                border: 1px solid {accent};
-            }}
-        """)
+        # 复杂 QSS(多选择器)走 raw 通道
+        # 选中态:从"整行蓝底"改为"蓝色边框"——避免和 tooltip 背景混色,
+        # 也让"已复制"反馈更克制(蓝边框就是视觉信号)
+        self._style(
+            self._result_list,
+            raw=(
+                f"QListWidget {{"
+                f"  background-color: transparent;"
+                f"  border: none;"
+                f"  outline: none;"
+                f"  font-size: {self._font_size('sm_md', 13)}px;"
+                f"}}"
+                f"QListWidget::item {{"
+                f"  color: {self._color('text.primary')};"
+                f"  padding: {self._spacing('spacing.sm', 8)}px {self._spacing('spacing.md', 12)}px;"
+                f"  border-bottom: 1px solid {self._BORDER_SUBTLE};"
+                f"  border-radius: {self._spacing('corner.xs', 4)}px;"
+                f"  border: 1px solid transparent;"  # 占位边框,选中态切换时不抖尺寸
+                f"}}"
+                f"QListWidget::item:selected {{"
+                f"  background-color: transparent;"  # 整行变蓝底 → 改为透明
+                f"  color: {accent};"
+                f"  border: 1px solid {accent};"     # 蓝色边框(单/双击后视觉提示)
+                f"}}"
+                f"QListWidget::item:hover {{"
+                f"  border: 1px solid {accent};"
+                f"}}"
+            ),
+        )
         self._result_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         result_layout.addWidget(self._result_list, stretch=1)
@@ -302,13 +364,52 @@ class ItemsPage(PageBase):
     #  结果交互
     # ════════════════════════════════════
 
-    def _on_item_double_clicked(self, item: QListWidgetItem):
-        """双击 → 复制名称到剪贴板。"""
+    def _on_item_clicked(self, item: QListWidgetItem):
+        """单击 → 复制英文名到剪贴板 + toast 状态提示(2 秒)。
+
+        设计意图:用户搜索结果一眼看到中英对照,但实际想用英文名(wf 市场、
+        warframe.market、英文 wiki 都用英文名),单击是最快的复制动作。
+        双击保留为复制中文,作为备选。
+        """
         from PySide6.QtWidgets import QApplication
         data = item.data(Qt.ItemDataRole.UserRole)
-        if data:
-            name = data.get("zh_name") or data.get("en_name", "")
-            QApplication.clipboard().setText(name)
+        if not data:
+            return
+        en_name = (data.get("en_name") or "").strip()
+        if not en_name:
+            # 没英文名就复制中文兜底(老物品/翻译缺失场景)
+            en_name = (data.get("zh_name") or "").strip()
+        if not en_name:
+            return
+        QApplication.clipboard().setText(en_name)
+        # 触发 toast 提示(右侧状态条,2 秒后自动清空)
+        self._show_copy_toast(en_name)
+
+    def _on_item_double_clicked(self, item: QListWidgetItem):
+        """双击 → 复制中文名到剪贴板 + toast 状态提示(2 秒)。
+
+        保留旧行为: 双击复制中文名,作为单击(英文)的备选。
+        """
+        from PySide6.QtWidgets import QApplication
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+        name = data.get("zh_name") or data.get("en_name", "")
+        if not name:
+            return
+        QApplication.clipboard().setText(name)
+        self._show_copy_toast(name)
+
+    def _show_copy_toast(self, name: str):
+        """显示"已复制:xxx"toast 提示,2 秒后自动清空。
+
+        用 QTimer 单次定时器,完全无副作用(不清空 stats_bar)。
+        """
+        msg = self._copy("items.copy_toast", "✓ 已复制: {name}", name=name)
+        self._copy_toast.setText(msg)
+        self._copy_toast.show()
+        # 重启定时器(连续点击时也只显示最后一条,2 秒后清空)
+        self._copy_toast_timer.start()
 
     # ── 事件过滤（用于检测鼠标离开列表区域）──
 
@@ -341,54 +442,86 @@ class ItemsPage(PageBase):
         if hasattr(self, '_tooltip_hide_timer'):
             self._tooltip_hide_timer.start(150)
 
-    def _create_tooltip_widget(self) -> QLabel:
-        """创建一次性悬浮窗 QLabel（整体背景 + 阴影 + 圆角）。"""
+    def _create_tooltip_widget(self) -> QFrame:
+        """创建可滚动的悬浮窗容器（整体背景 + 阴影 + 圆角）。"""
         from PySide6.QtWidgets import QGraphicsDropShadowEffect
 
-        tip = QLabel(self.window())
-        tip.setWindowFlags(
+        container = QFrame(self.window())
+        container.setWindowFlags(
             Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint
         )
-        tip.setTextFormat(Qt.TextFormat.RichText)
-        tip.setOpenExternalLinks(False)
-        tip.setWordWrap(True)
+        container.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        scroll = QScrollArea(container)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameStyle(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        label = QLabel()
+        label.setTextFormat(Qt.TextFormat.RichText)
+        label.setOpenExternalLinks(False)
+        label.setWordWrap(True)
+        label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+
+        scroll.setWidget(label)
+        layout.addWidget(scroll)
 
         # 整体背景色（与主题一致）
-        bg = self._color("components.card.bg")
-        border_color = self._color("border.subtle")
-        tip.setStyleSheet(
-            f"QLabel {{"
-            f"  background:{bg};"
-            f"  border:1px solid {border_color};"
-            f"  border-radius:{self._spacing('corner.sm', 6)}px;"
-            f"  padding:{self._spacing('spacing.sm', 8)}px {self._spacing('spacing.lg', 16)}px;"
-            f"}}"
+        self._style(
+            container,
+            background="components.card.bg",
+            raw=(
+                f"border: 1px solid {self._color('border.subtle')};"
+                f"border-radius: {self._spacing('corner.sm', 6)}px;"
+            ),
+        )
+        self._style(
+            label,
+            transparent=True,
+            raw=(
+                f"padding: {self._spacing('spacing.sm', 8)}px "
+                f"{self._spacing('spacing.lg', 16)}px;"
+            ),
         )
 
         # 阴影效果
-        shadow = QGraphicsDropShadowEffect(tip)
+        shadow = QGraphicsDropShadowEffect(container)
         shadow.setBlurRadius(16)
         shadow.setColor(QColor(0, 0, 0, 140))
         shadow.setOffset(0, 4)
-        tip.setGraphicsEffect(shadow)
+        container.setGraphicsEffect(shadow)
+
+        # 保存内部控件引用，便于外部更新内容
+        container._label = label
+        container._scroll = scroll
 
         # 鼠标进入悬浮窗时取消隐藏定时器
-        tip.enterEvent = lambda e: (
-            getattr(self, '_tooltip_hide_timer', type('', (), {'start': lambda *a: None})()).stop()
+        container.enterEvent = lambda e: (
+            getattr(self, '_tooltip_hide_timer', type('', (), {'stop': lambda *a: None})()).stop()
             if hasattr(self, '_tooltip_hide_timer') else None,
             None
         )[-1] or None
 
         # 鼠标离开悬浮窗 → 立即隐藏
-        tip.leaveEvent = lambda e: self._hide_tooltip()
+        container.leaveEvent = lambda e: self._hide_tooltip()
 
-        return tip
+        return container
 
     def _show_tooltip_widget(self, html: str, item: QListWidgetItem):
-        """定位并显示悬浮窗，确保不溢出屏幕。"""
+        """定位并显示悬浮窗，自动限制最大尺寸并在超出时启用滚动。"""
         from PySide6.QtWidgets import QApplication
 
-        screen = QApplication.primaryScreen()
+        # 多显示器环境下，优先以主窗口所在屏幕为基准；
+        # QCursor.pos() + screenAt 在跨屏/DPI 缩放场景下容易误判到主屏。
+        host = self.window()
+        screen = host.screen() if host else None
+        if not screen:
+            screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         scr_geo = screen.availableGeometry() if screen else None
 
         if not hasattr(self, '_tip_widget') or self._tip_widget is None:
@@ -399,8 +532,26 @@ class ItemsPage(PageBase):
             self._tooltip_hide_timer.timeout.connect(self._hide_tooltip)
 
         tip = self._tip_widget
-        tip.setText(html)
-        tip.adjustSize()
+        label = tip._label
+        label.setText(html)
+
+        # 限制悬浮窗最大尺寸，避免过长内容撑破屏幕
+        max_width = 420
+        max_height = 480
+        if scr_geo:
+            max_height = int(scr_geo.height() * 0.7)
+
+        # 先让 QLabel 按自然宽度计算，再用 heightForWidth 估算固定宽度下的高度
+        label.setMinimumWidth(220)
+        label.adjustSize()
+        content_width = max_width - 24  # 预留边距与滚动条空间
+        content_h = label.heightForWidth(content_width)
+        if content_h <= 0:
+            content_h = label.sizeHint().height()
+
+        tip_w = max_width
+        tip_h = min(content_h + 16, max_height)
+        tip.setFixedSize(tip_w, tip_h)
 
         # 定位：在鼠标右下方，偏移 16px
         pos = QCursor.pos()
@@ -408,9 +559,6 @@ class ItemsPage(PageBase):
 
         # ── 防溢出：检查屏幕边界 ──
         if scr_geo:
-            tip_w = tip.width()
-            tip_h = tip.height()
-
             # 右侧溢出 → 贴右边
             if pos.x() + tip_w > scr_geo.right():
                 pos.setX(scr_geo.right() - tip_w - 4)
@@ -422,6 +570,10 @@ class ItemsPage(PageBase):
             # 左侧溢出 → 贴左边
             if pos.x() < scr_geo.left():
                 pos.setX(scr_geo.left() + 4)
+
+            # 上侧溢出 → 贴顶部（留出一点边距）
+            if pos.y() < scr_geo.top():
+                pos.setY(scr_geo.top() + 4)
 
         tip.move(pos)
         tip.show()
@@ -519,10 +671,10 @@ class ItemsPage(PageBase):
                     f"</div>"
                 )
 
-            # ── 掉落途径（max-height 防溢出，超出滚动）──
-            drop_locs, drop_total = self._svc.get_relic_drop_locations(en_name)
+            # ── 掉落途径（悬浮窗已支持滚动，显示全部）──
+            drop_locs, drop_total = self._svc.get_relic_drop_locations(en_name, max_results=None)
             if drop_locs:
-                tip = f"掉落途径 (共{drop_total}，显示{drop_total if drop_total <= 40 else 40})"
+                tip = f"掉落途径 (共{drop_total})"
                 parts.append(
                     f"<div style='margin-top:6px;margin-bottom:1px;'>"
                     f"<span style='color:{cyan};font-size:11px;font-weight:bold;'>| {tip}</span>"
@@ -612,7 +764,11 @@ class ItemsPage(PageBase):
                     )
         else:
             # ═══ 普通物品：显示掉落来源 ═══
-            sources = self._svc.get_drop_sources(en_name, unique_name=item_data.get("unique_name", ""))
+            sources = self._svc.get_drop_sources(
+                en_name,
+                unique_name=item_data.get("unique_name", ""),
+                max_results=None,
+            )
 
             if sources:
                 # 按 source_type 分组 + 翻译中文标签
@@ -666,7 +822,7 @@ class ItemsPage(PageBase):
 
                         parts.append(
                             f"<div style='padding:1px 0 1px 12px;font-size:11px;"
-                            f"white-space:nowrap;color:{text_sec};'>"
+                            f"color:{text_sec};'>"
                             f"&bull; {self._esc(loc)}{extra}"
                             f"</div>"
                         )

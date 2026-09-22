@@ -1,5 +1,10 @@
 """
-CyberToggleSwitch — 赛博风格切角开关按钮。
+[L4] CyberToggleSwitch — 赛博风格切角开关按钮
+
+继承: CyberWidgetMixin + QPushButton(checkable)
+依赖: core.tokens.manager
+职责: 切角开关,关闭/开启两态切色
+信号: toggled(bool)(继承自 QPushButton)
 
 使用 CyberWidgetMixin + QPushButton（checkable）实现。
 - 关闭态：透明填充 + 黄色描边（accent.primary）
@@ -11,6 +16,20 @@ CyberToggleSwitch — 赛博风格切角开关按钮。
 
     sw = CyberToggleSwitch("GAUSS", checked=False)
     sw.toggled.connect(lambda checked: print(f"GAUSS: {checked}"))
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L4] (core/widgets/)
+允许依赖:  core.widgets.base.CyberWidgetMixin, core.tokens.manager, PySide6
+禁止依赖:  core.services/*, core.pages/*, core.state/*, data/*
+必读规范:  .trae/rules/开发规范.md §6.4
+
+本文件相关红线:
+- ✗ 禁止 __init__ 调 super().__init__() → 必须 QPushButton.__init__(self, text, parent)
+- ✗ 禁止 paintEvent 漏 super() → 文字/状态指示会失效
+- ✗ 禁止硬编码颜色 / 尺寸 → 必须 self.token() / self.space()
+- ✗ 禁止调 Service / 发网络请求 / 读写 JSON
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.4。
 """
 
 from __future__ import annotations
@@ -41,11 +60,16 @@ class CyberToggleSwitch(CyberWidgetMixin, QPushButton):
         text: str = "",
         checked: bool = False,
         parent: Optional[QWidget] = None,
+        on_off: bool = False,
     ):
         QPushButton.__init__(self, text, parent)
 
         self.setCheckable(True)
         self.setChecked(checked)
+
+        # ON/OFF 状态文字模式：开启后文字随状态显示 "ON"/"OFF"，
+        # 忽略构造传入的 text（用于无标签、纯状态指示的开关）
+        self._on_off_mode: bool = bool(on_off)
 
         h = self.space("height.toggle_sw", 28)
         self.setFixedHeight(h)
@@ -53,6 +77,16 @@ class CyberToggleSwitch(CyberWidgetMixin, QPushButton):
 
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet("QPushButton { border: none; background: transparent; }")
+
+    # ── ON/OFF 模式 ──
+
+    def set_on_off_mode(self, enabled: bool) -> None:
+        """开关 ON/OFF 状态文字模式（True=文字随状态显示 ON/OFF）。"""
+        enabled = bool(enabled)
+        if self._on_off_mode == enabled:
+            return
+        self._on_off_mode = enabled
+        self.update()
 
     # ── 事件转发到状态机 ──
 
@@ -132,7 +166,8 @@ class CyberToggleSwitch(CyberWidgetMixin, QPushButton):
         painter.setFont(font)
 
         fm = QFontMetrics(font)
-        txt = self.text()
+        # ON/OFF 模式：文字随状态；否则用外部设置的 text
+        txt = ("ON" if is_checked else "OFF") if self._on_off_mode else self.text()
         if txt:
             cx = w / 2.0 - fm.horizontalAdvance(txt) / 2.0
             cy = h / 2.0 + fm.ascent() / 2.0 - fm.descent() / 2.0

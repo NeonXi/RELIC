@@ -1,9 +1,28 @@
 """
-遗物名称识别器
+[L-Recognizer] RelicNameRecognizer — 遗物名称识别器
 
-从遗物选择界面截图中识别所有遗物名称（自适应中/英文）。
+从遗物选择界面截图中识别所有遗物名称(自适应中/英文)。
 
-重构后继承 BaseOCR，消除重复的 OCR 样板代码。
+依赖: numpy + rapidocr-onnxruntime
+被谁用: core.services.screenshot_pipeline
+
+重构后继承 BaseOCR,消除重复的 OCR 样板代码。
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L-Recognizer] (core/recognizers/)
+允许依赖:  numpy, onnxruntime, opencv-python, sqlite3, rapidocr-onnxruntime
+禁止依赖:  core.widgets/* / core.pages/* / core.state/*
+           (不能调 UI,只能输出结构化结果)
+必读规范:  .trae/rules/开发规范.md §6.3
+
+本文件相关红线:
+- 禁止返回 Qt 控件 → 只能返回 dict(含 en_name / zh_name / slug / quality)
+- 禁止阻塞主线程的长任务 → 必须放 QThread/Signal
+- 禁止吞掉 OCR 错误 → 必须 try/except 记录到日志
+- 禁止在 OCR 链路里调网络 API → OCR 是离线识别
+- 禁止 import 整个 core.* → 只 import 同层 (recognizers) 模块
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.3。
 """
 
 import re
@@ -265,6 +284,7 @@ class RelicNameRecognizer(BaseOCR):
     # ---- 主识别流程 ----
 
     def recognize_all_with_boxes(self, image: np.ndarray) -> list[tuple[str, list]]:
+        """主识别入口:输入 numpy 图像,返回 [(遗物名, 包围盒), ...](失败返回空列表)。"""
         t0 = time.perf_counter()
 
         # -- 管线：OCR → 过滤 → 匹配 --

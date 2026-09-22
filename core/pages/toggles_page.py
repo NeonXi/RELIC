@@ -15,26 +15,41 @@
   - data/feature_toggles.json （功能开关）
   - data/triggers.json       （辅助触发器）
   - data/hotkeys.json        （快捷键）
-"""
 
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L2] (core/pages/)
+允许依赖:  core.widgets/*, core.hotkey_config, core.trigger_config, data/(读), PySide6
+禁止依赖:  core.tokens/* 直接调用(只能间接)
+           任何反向依赖 widgets
+必读规范:  .trae/rules/开发规范.md §6.5
+
+本文件相关红线:
+- 禁止 setStyleSheet(f-string) -> 必须用 Token 或继承自 CyberWidget
+- 禁止重写 paintEvent -> 视觉交给 Widget
+- 禁止直接读写 JSON -> 走 config_service / hotkey_config.save()
+- 禁止快捷键硬编码 -> 必须从 DEFAULT_HOTKEYS 动态生成
+- 禁止硬编码颜色 / 尺寸 -> 必须 token / space
+- 禁止用户可见文案硬编码 -> 必须 _copy() 取自 tokens
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.5,别走捷径。
+"""
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox,
-    QSizePolicy, QFrame, QMessageBox,
+    QFrame,
 )
-from PySide6.QtCore import Qt, Signal, QObject
-from PySide6.QtGui import QFont, QKeyEvent
-
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont
 from core.pages.base_page import PageBase
-from core.widgets.panel import CyberPanel
 from core.widgets.button import CyberButton
 from core.widgets.card import CyberCard
 from core.widgets.toggle_switch import CyberToggleSwitch
+from core.widgets.hotkey_capture_edit import HotkeyCaptureEdit
 from core.tokens.manager import TokenManager
 from core.trigger_config import (
     load_triggers, save_triggers,
@@ -48,7 +63,6 @@ _TOGGLE_DEFS = [
     # ── 核心功能 ──
     ("check_status", True, "core"),
     ("query_parts",  True, "core"),
-    ("translate",    False, "core"),
 ]
 
 _GROUP_NAMES = {
@@ -59,175 +73,22 @@ _GROUP_NAMES = {
 _DEFAULT_VALUES = {k: v for k, v, _ in _TOGGLE_DEFS}
 
 # ── 快捷键定义 ──
+# 动态从 DEFAULT_HOTKEYS 生成（保证 hotkey_config.py 和 UI 一致）
 # 格式: (action_key, token_label, 默认值)
-_HOTKEY_DEFS = [
-    ("select",     "hotkey.label_select",     "ctrl+g"),
-    ("fullscreen", "hotkey.label_fullscreen", "ctrl+h"),
-    ("eye_mask",   "hotkey.label_eye_mask",   "ctrl+j"),
-]
+# token_label 形如 "hotkeys.label_select",对应 cyberpunk.yaml 中 copy.hotkeys.label_*
+def _build_hotkey_defs() -> list[tuple[str, str, str]]:
+    from core.hotkey_config import DEFAULT_HOTKEYS
+    defs = []
+    for action, default_hk in DEFAULT_HOTKEYS.items():
+        token_key = f"hotkeys.label_{action}"
+        defs.append((action, token_key, default_hk))
+    return defs
+
+_HOTKEY_DEFS = _build_hotkey_defs()
 
 
-class _HotkeyCaptureEdit(QWidget):
-    """热键捕获输入框：点击后按下组合键即可记录。"""
-
-    captured = Signal(str)  # (key_str)
-    capture_started = Signal()   # 进入捕获模式
-    capture_stopped = Signal()  # 退出捕获模式
-
-    def __init__(self, initial: str = "", parent=None):
-        super().__init__(parent)
-        self._current = initial
-        self._capturing = False
-        self._pressed_modifiers: set[str] = set()
-        self._pressed_keys: set[str] = set()
-
-        self.setFixedHeight(32)
-        self.setMinimumWidth(140)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def paintEvent(self, event):
-        from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        # 背景
-        path = QPainterPath()
-        r = 6
-        path.addRoundedRect(0, 0, self.width(), self.height(), r, r)
-
-        if self._capturing:
-            bg = TokenManager.instance().get_qcolor("accent.primary").darker(300)
-            border = TokenManager.instance().get_qcolor("accent.secondary")
-        elif self.hasFocus():
-            bg = TokenManager.instance().get_qcolor("bg.raised")
-            border = TokenManager.instance().get_qcolor("border.focus")
-        else:
-            bg = TokenManager.instance().get_qcolor("bg.base")
-            border = TokenManager.instance().get_qcolor("border.subtle")
-
-        p.fillPath(path, QBrush(bg))
-        p.setPen(QPen(border, 1))
-        p.drawPath(path)
-
-        # 文字
-        if self._capturing:
-            text = "按下组合键..."
-            color = TokenManager.instance().get_qcolor("accent.secondary")
-        else:
-            text = self._format_display(self._current)
-            color = TokenManager.instance().get_qcolor("text.primary")
-
-        p.setPen(color)
-        f = self.font()
-        f.setPointSize(11)
-        p.setFont(f)
-        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, text)
-
-    def _format_display(self, key_str: str) -> str:
-        """格式化显示：首字母大写 + 空格分隔。"""
-        if not key_str:
-            return "未设置"
-        return " + ".join(k.upper() for k in key_str.split("+"))
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._start_capture()
-
-    def _start_capture(self):
-        """开始捕获模式。"""
-        self._capturing = True
-        self._pressed_modifiers.clear()
-        self._pressed_keys.clear()
-        self.setFocus()
-        self.update()
-        self.grabKeyboard()
-        self.capture_started.emit()
-
-    def _stop_capture(self):
-        """结束捕获模式。"""
-        self._capturing = False
-        self.releaseKeyboard()
-        self.update()
-        self.capture_stopped.emit()
-
-    def keyPressEvent(self, event: QKeyEvent):
-        if not self._capturing:
-            super().keyPressEvent(event)
-            return
-
-        # 忽略纯修饰键按下
-        mod_map = {
-            Qt.Key.Key_Control: "ctrl",
-            Qt.Key.Key_Alt:     "alt",
-            Qt.Key.Key_Shift:   "shift",
-            Qt.Key.Key_Meta:    "win",
-        }
-
-        if event.key() in mod_map:
-            self._pressed_modifiers.add(mod_map[event.key()])
-            return
-
-        # 普通键 → 组合完成
-        key_name = self._map_key(event.key())
-        if not key_name:
-            return
-
-        parts = sorted(self._pressed_modifiers) + [key_name]
-        new_hotkey = "+".join(parts)
-        self._current = new_hotkey
-        self.captured.emit(new_hotkey)
-        self._stop_capture()
-
-    def keyReleaseEvent(self, event: QKeyEvent):
-        mod_map = {
-            Qt.Key.Key_Control: "ctrl",
-            Qt.Key.Key_Alt:     "alt",
-            Qt.Key.Key_Shift:   "shift",
-            Qt.Key.Key_Meta:    "win",
-        }
-        if event.key() in mod_map:
-            self._pressed_modifiers.discard(mod_map[event.key()])
-
-    def focusOutEvent(self, event):
-        if self._capturing:
-            self._stop_capture()
-        super().focusOutEvent(event)
-
-    @staticmethod
-    def _map_key(qt_key: int) -> str | None:
-        """Qt 键码 → 小写字符串。"""
-        _KEY_MAP = {
-            Qt.Key.Key_A: 'a', Qt.Key.Key_B: 'b', Qt.Key.Key_C: 'c', Qt.Key.Key_D: 'd',
-            Qt.Key.Key_E: 'e', Qt.Key.Key_F: 'f', Qt.Key.Key_G: 'g', Qt.Key.Key_H: 'h',
-            Qt.Key.Key_I: 'i', Qt.Key.Key_J: 'j', Qt.Key.Key_K: 'k', Qt.Key.Key_L: 'l',
-            Qt.Key.Key_M: 'm', Qt.Key.Key_N: 'n', Qt.Key.Key_O: 'o', Qt.Key.Key_P: 'p',
-            Qt.Key.Key_Q: 'q', Qt.Key.Key_R: 'r', Qt.Key.Key_S: 's', Qt.Key.Key_T: 't',
-            Qt.Key.Key_U: 'u', Qt.Key.Key_V: 'v', Qt.Key.Key_W: 'w', Qt.Key.Key_X: 'x',
-            Qt.Key.Key_Y: 'y', Qt.Key.Key_Z: 'z',
-            Qt.Key.Key_0: '0', Qt.Key.Key_1: '1', Qt.Key.Key_2: '2', Qt.Key.Key_3: '3',
-            Qt.Key.Key_4: '4', Qt.Key.Key_5: '5', Qt.Key.Key_6: '6', Qt.Key.Key_7: '7',
-            Qt.Key.Key_8: '8', Qt.Key.Key_9: '9',
-            Qt.Key.Key_F1: 'f1', Qt.Key.Key_F2: 'f2', Qt.Key.Key_F3: 'f3', Qt.Key.Key_F4: 'f4',
-            Qt.Key.Key_F5: 'f5', Qt.Key.Key_F6: 'f6', Qt.Key.Key_F7: 'f7', Qt.Key.Key_F8: 'f8',
-            Qt.Key.Key_F9: 'f9', Qt.Key.Key_F10: 'f10', Qt.Key.Key_F11: 'f11', Qt.Key.Key_F12: 'f12',
-            Qt.Key.Key_Space: 'space',
-            Qt.Key.Key_Tab: 'tab',
-            Qt.Key.Key_Return: 'enter',
-            Qt.Key.Key_Enter: 'enter',
-            Qt.Key.Key_Escape: None,  # 取消捕获
-            Qt.Key.Key_Backspace: None,
-        }
-        return _KEY_MAP.get(qt_key, chr(qt_key).lower() if 32 < qt_key < 127 else None)
-
-    @property
-    def value(self) -> str:
-        return self._current
-
-    @value.setter
-    def value(self, v: str):
-        self._current = v
-        self.update()
+# 注意: 原 _HotkeyCaptureEdit 内嵌类已迁移到 core/widgets/hotkey_capture_edit.py
+# 原因: §6.5 禁止 Page 内嵌自定义控件
 
 
 class TogglesPage(PageBase):
@@ -238,13 +99,14 @@ class TogglesPage(PageBase):
     page_icon = "nav_toggles"
 
     def __init__(self):
-        self._toggles_path = Path(__file__).resolve().parent.parent.parent / 'data' / 'feature_toggles.json'
+        from core.paths import user_data_dir
+        self._toggles_path = user_data_dir() / 'feature_toggles.json'
         self._toggles_data: dict[str, bool] = {}
         self._checkboxes: dict[str, QCheckBox] = {}
 
         # 快捷键数据
         self._hotkeys_data: dict[str, str] = {}
-        self._hotkey_edits: dict[str, _HotkeyCaptureEdit] = {}
+        self._hotkey_edits: dict[str, HotkeyCaptureEdit] = {}
 
         # 辅助触发器数据
         self._triggers_data: list[dict] = []
@@ -304,7 +166,7 @@ class TogglesPage(PageBase):
         try:
             from core.hotkey_config import load_hotkeys, DEFAULT_HOTKEYS
             raw = load_hotkeys()
-            # 只取我们关心的 action（排除 query_price 等）
+            # 只取本页关心的 action（按 _HOTKEY_DEFS 过滤）
             self._hotkeys_data = {
                 k: raw.get(k, DEFAULT_HOTKEYS.get(k, ""))
                 for k, _, _ in _HOTKEY_DEFS
@@ -397,6 +259,7 @@ class TogglesPage(PageBase):
     # ════════════════════════════════════
 
     def build_content(self) -> QWidget:
+        """构建功能开关页(运行时启用/禁用各功能模块的开关卡片)。"""
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(
@@ -408,32 +271,20 @@ class TogglesPage(PageBase):
         # ── 标题 ──
         title = QLabel(self._copy("toggles.title", "功能控制面板"))
         title.setFont(QFont("Iceberg", self._font_size("lg_xl", 18)))
-        accent = self._color("accent.primary")
-        title.setStyleSheet(f"color: {accent}; padding: 4px 0;")
+        self._style(title, color="accent.primary", padding=("4px", "0"))
         layout.addWidget(title)
 
         desc = QLabel(
             self._copy("toggles.desc",
                        "开启或关闭各项功能模块，修改快捷键后需重启生效")
         )
-        desc.setStyleSheet(
-            f"color: {self._color('text.tertiary')}; "
-            f"font-size: {self._font_size('sm', 12)}px; padding: 0 0 12px 0;"
+        self._style(
+            desc,
+            color="text.tertiary",
+            font_size="sm",
+            padding=("0", "0", "12px", "0"),
         )
         layout.addWidget(desc)
-
-        # ── 按钮栏 ──
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-
-        btn_reset = CyberButton(
-            text=self._copy("toggles.btn_reset", "恢复默认"), variant="ghost"
-        )
-        btn_reset.setFixedWidth(90)
-        btn_reset.clicked.connect(self._on_reset_defaults)
-        btn_row.addWidget(btn_reset)
-
-        layout.addLayout(btn_row)
 
         # ════════════════════
         #  第一区：功能开关
@@ -471,6 +322,11 @@ class TogglesPage(PageBase):
         self._build_triggers_card(layout)
 
         # ════════════════════
+        #  第二点五区：CD 辅助显示 总开关
+        # ════════════════════
+        self._build_cd_assist_card(layout)
+
+        # ════════════════════
         #  第三区：快捷键绑定
         # ════════════════════
         hk_card = CyberCard(title=self._copy("hotkeys.card_binding", "快捷键绑定"))
@@ -492,22 +348,23 @@ class TogglesPage(PageBase):
         # ── 提示 ──
         tip_frame = QFrame()
         _tip_accent = TokenManager.instance().get_qcolor("accent.primary")
-        tip_frame.setStyleSheet(f"""
-            QFrame {{
-                background-color: rgba({_tip_accent.red()}, {_tip_accent.green()}, {_tip_accent.blue()}, 0.06);
-                border: 1px solid rgba({_tip_accent.red()}, {_tip_accent.green()}, {_tip_accent.blue()}, 0.2);
-                border-radius: 4px;
-                padding: {self._spacing('spacing.sm', 8)}px;
-            }}
-        """)
+        # 复杂 QSS(rgba 透明)走 raw 通道
+        self._style(
+            tip_frame,
+            raw=(
+                f"QFrame {{"
+                f"  background-color: rgba({_tip_accent.red()}, {_tip_accent.green()}, {_tip_accent.blue()}, 0.06);"
+                f"  border: 1px solid rgba({_tip_accent.red()}, {_tip_accent.green()}, {_tip_accent.blue()}, 0.2);"
+                f"  border-radius: 4px;"
+                f"  padding: {self._spacing('spacing.sm', 8)}px;"
+                f"}}"
+            ),
+        )
         tip_layout = QHBoxLayout(tip_frame)
         tip_layout.setContentsMargins(12, 8, 12, 8)
 
         tip_icon = QLabel("!")
-        tip_icon.setStyleSheet(
-            f"color: {self._color('accent.primary')}; "
-            f"font-size: {self._font_size('md', 14)}px; font-weight: bold;"
-        )
+        self._style(tip_icon, color="accent.primary", font_size="md", font_weight="bold")
         tip_icon.setFixedWidth(20)
         tip_layout.addWidget(tip_icon)
 
@@ -516,10 +373,7 @@ class TogglesPage(PageBase):
                        "提示：修改快捷键后请确认不与其他软件冲突，部分修改需要重启应用生效。"
                        "支持的修饰键：Ctrl / Alt / Shift / Win")
         )
-        tip_text.setStyleSheet(
-            f"color: {self._color('alias.text.tertiary')}; "
-            f"font-size: {self._font_size('xs', 11)}px;"
-        )
+        self._style(tip_text, color="alias.text.tertiary", font_size="xs")
         tip_text.setWordWrap(True)
         tip_layout.addWidget(tip_text, stretch=1)
 
@@ -537,27 +391,31 @@ class TogglesPage(PageBase):
         cb = QCheckBox(label_text)
         cb.setChecked(bool(current_val))
         cb.setCursor(Qt.CursorShape.PointingHandCursor)
-        cb.setStyleSheet(f"""
-            QCheckBox {{
-                color: {self._color('text.primary')};
-                font-size: {self._font_size('sm_md', 13)}px;
-                spacing: 8px;
-            }}
-            QCheckBox::indicator {{
-                width: 18px;
-                height: 18px;
-                border: 1.5px solid {self._color('border.emphasis')};
-                border-radius: 4px;
-                background: transparent;
-            }}
-            QCheckBox::indicator:checked {{
-                background-color: {self._color('accent.secondary')};
-                border-color: {self._color('accent.secondary')};
-            }}
-            QCheckBox::indicator:hover {{
-                border-color: {self._color('accent.secondary')};
-            }}
-        """)
+        # 复杂 QSS(多选择器)走 raw 通道
+        self._style(
+            cb,
+            raw=(
+                f"QCheckBox {{"
+                f"  color: {self._color('text.primary')};"
+                f"  font-size: {self._font_size('sm_md', 13)}px;"
+                f"  spacing: 8px;"
+                f"}}"
+                f"QCheckBox::indicator {{"
+                f"  width: 18px;"
+                f"  height: 18px;"
+                f"  border: 1.5px solid {self._color('border.emphasis')};"
+                f"  border-radius: 4px;"
+                f"  background: transparent;"
+                f"}}"
+                f"QCheckBox::indicator:checked {{"
+                f"  background-color: {self._color('accent.secondary')};"
+                f"  border-color: {self._color('accent.secondary')};"
+                f"}}"
+                f"QCheckBox::indicator:hover {{"
+                f"  border-color: {self._color('accent.secondary')};"
+                f"}}"
+            ),
+        )
 
         # ── 状态点（先创建，再在信号中引用）──
         status_dot = QLabel("●" if current_val else "○")
@@ -597,7 +455,7 @@ class TogglesPage(PageBase):
         row.addWidget(name_lbl)
 
         current_val = self._hotkeys_data.get(action_key, default_val)
-        key_edit = _HotkeyCaptureEdit(initial=current_val)
+        key_edit = HotkeyCaptureEdit(initial=current_val)
         key_edit.captured.connect(lambda val, k=action_key: self._on_hotkey_captured(k, val))
         # ★ 捕获模式时暂停全局热键，避免按键被热键拦截
         key_edit.capture_started.connect(self._pause_hotkeys)
@@ -671,6 +529,11 @@ class TogglesPage(PageBase):
         """导航到触发器配置页面。"""
         if self._app_shell is not None:
             self._app_shell._switch_to("triggers")
+
+    def _goto_cd_assist_page(self):
+        """导航到 CD 辅助显示配置页面。"""
+        if self._app_shell is not None:
+            self._app_shell._switch_to("cd_assist")
 
     def _populate_triggers_section(self) -> None:
         """★ 清除旧控件并重新加载触发器数据构建开关行。
@@ -775,6 +638,100 @@ class TogglesPage(PageBase):
         self._apply_triggers()
 
     # ════════════════════════════════════
+    #  CD 辅助显示 总开关(与 cd_assist_page 共享 service)
+    # ════════════════════════════════════
+
+    def _build_cd_assist_card(self, parent_layout) -> None:
+        """构造"CD 辅助显示"总开关卡片。
+
+        与 CdAssistPage 共享同一个 CdAssistService 单例,任何一边
+        改动都会同步到另一边。
+        """
+        try:
+            from core.services.cd_assist_service import CdAssistService
+            service = CdAssistService.instance()
+        except Exception as e:
+            print(f"[TogglesPage] 加载 CdAssistService 失败: {e}", flush=True)
+            return
+
+        card = CyberCard(title=self._copy("nav.cd_assist", "CD 辅助显示"))
+        clayout = card.content_layout()
+        clayout.setContentsMargins(
+            self._spacing("md", 16),
+            self._spacing("lg_xl", 28),
+            self._spacing("md", 16),
+            self._spacing("md", 16),
+        )
+        clayout.setSpacing(self._spacing("sm", 10))
+
+        # ① 标题行
+        row = QHBoxLayout()
+        row.setSpacing(self._spacing("sm_md", 12))
+        label = QLabel("启用 CD 辅助显示")
+        self._style(
+            label,
+            color="text.primary",
+            font_size="md",
+            font_weight="bold",
+        )
+        row.addWidget(label)
+        row.addStretch(1)
+
+        self._cd_assist_toggle = CyberToggleSwitch(
+            "", checked=service.is_enabled(), on_off=True
+        )
+        self._cd_assist_toggle.toggled.connect(self._on_cd_assist_toggled)
+        row.addWidget(self._cd_assist_toggle)
+        clayout.addLayout(row)
+
+        # ② 提示
+        tip = QLabel(
+            self._copy(
+                "cd_assist.toggles_tip",
+                "按 1/2/3/4 键在屏幕中心显示对应技能的倒计时(详细参数请到「CD 辅助显示」页设置)。",
+            )
+        )
+        self._style(tip, color="text.tertiary", font_size="sm")
+        tip.setWordWrap(True)
+        clayout.addWidget(tip)
+
+        # ③ 跳转按钮(与辅助触发器 box 的"前往详细配置"对齐,方便用户快速跳过去)
+        goto_btn = CyberButton(
+            text=self._copy("cd_assist.toggles_goto", "前往详细配置"),
+            variant="outlined",
+        )
+        goto_btn.setFixedWidth(120)
+        goto_btn.clicked.connect(self._goto_cd_assist_page)
+        clayout.addWidget(goto_btn)
+
+        # ④ 跟随 service 状态变化(让两个开关双向同步)
+        try:
+            service.enabled_changed.connect(self._on_service_enabled_changed_sync)
+        except Exception:
+            pass
+
+        parent_layout.addWidget(card)
+
+    def _on_cd_assist_toggled(self, on: bool) -> None:
+        """本卡片开关变化 → service.set_enabled。"""
+        try:
+            from core.services.cd_assist_service import CdAssistService
+            CdAssistService.instance().set_enabled(on)
+        except Exception as e:
+            print(f"[TogglesPage] 切换 CD 辅助总开关失败: {e}", flush=True)
+
+    def _on_service_enabled_changed_sync(self, on: bool) -> None:
+        """service 状态变化 → 同步本页 UI(不会再次触发 set_enabled,因 setChecked 不发 toggled)。"""
+        if not hasattr(self, '_cd_assist_toggle') or self._cd_assist_toggle is None:
+            return
+        try:
+            self._cd_assist_toggle.blockSignals(True)
+            self._cd_assist_toggle.setChecked(on)
+            self._cd_assist_toggle.blockSignals(False)
+        except Exception:
+            pass
+
+    # ════════════════════════════════════
     #  操作回调
     # ════════════════════════════════════
 
@@ -803,28 +760,6 @@ class TogglesPage(PageBase):
         # ★ 从磁盘重新加载触发器数据，重建整个触发器开关区域
         self._populate_triggers_section()
         print(f"[TogglesPage] on_enter() 完成, 复选框数={len(self._trigger_checkboxes)}", flush=True)
-
-    def _on_reset_defaults(self):
-        """恢复默认值并即时保存。"""
-        # 功能开关恢复默认（阻断信号，避免每个 checkbox 触发一次保存）
-        for key, default_val in _DEFAULT_VALUES.items():
-            cb = self._checkboxes.get(key)
-            if cb is not None:
-                cb.blockSignals(True)
-                cb.setChecked(default_val)
-                cb.blockSignals(False)
-            self._toggles_data[key] = default_val
-
-        # 热键恢复默认
-        for action_key, _, default_val in _HOTKEY_DEFS:
-            edit = self._hotkey_edits.get(action_key)
-            if edit is not None:
-                edit.value = default_val
-            self._hotkeys_data[action_key] = default_val
-
-        # 一次性保存
-        self._apply_toggles()
-        self._apply_hotkeys()
 
     def _get_shell(self):
         """获取 AppShell 实例。"""

@@ -3,7 +3,23 @@
 
 依赖: widgets/
 职责: 显示项目信息、版本号、作者信息、社交媒体链接
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L2] (core/pages/)
+允许依赖:  core.widgets/*, core.constants, PySide6
+禁止依赖:  core.tokens/* 直接调用(只能间接), 任何反向依赖 widgets
+必读规范:  .trae/rules/开发规范.md §6.5
+
+本文件相关红线:
+- ✗ 禁止 setStyleSheet(f"...") → 必须用 Token 或继承自 CyberWidget
+- ✗ 禁止重写 paintEvent → 视觉交给 Widget
+- ✗ 禁止硬编码版本号 / 仓库地址 → 走 core.constants
+- ✗ 禁止硬编码颜色 / 尺寸 → 必须 token / space
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.5,别走捷径。
 """
+
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QFrame, QSizePolicy,
@@ -22,6 +38,11 @@ GITHUB_URL = "https://github.com/WARFRAME-RELIC"
 
 
 class AboutPage(PageBase):
+    """「关于作者」页面。
+
+    展示项目版本、作者信息、B站/GitHub 链接等。
+    用于让用户快速了解项目来源和反馈渠道。
+    """
     page_id = "about"
     page_title = ""  # 由 nav token 动态获取
     page_icon = "nav_about"
@@ -91,6 +112,7 @@ class AboutPage(PageBase):
     # ══════════════════════════════════
 
     def build_content(self) -> QWidget:
+        """构建「关于」页主内容(版本号/作者/B站/GitHub 链接)。"""
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(20, 16, 20, 20)
@@ -106,13 +128,13 @@ class AboutPage(PageBase):
 
         title = QLabel("WARFRAME RELIC")
         title.setFont(QFont("Monoton", 28))
-        title.setStyleSheet(f"color: {accent}; padding: 8px 0 0 0;")
+        self._style(title, color="accent.primary", padding=("8px", "0", "0", "0"))
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
 
         subtitle = QLabel("遗物数据查询工具 · Cyberpunk UI")
         subtitle.setFont(QFont("Iceberg", 13))
-        subtitle.setStyleSheet(f"color: {text_tertiary}; padding: 0 0 4px 0;")
+        self._style(subtitle, color="text.tertiary", padding=("0", "0", "4px", "0"))
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(subtitle)
 
@@ -201,7 +223,7 @@ class AboutPage(PageBase):
             "• Prime 部件市场价格参考\n"
             "• 掉落来源追踪（任务、赏金、突击等）\n"
             "• 游戏内截图 OCR 自动识别遗物\n"
-            "• 物品中英文翻译与拼音搜索\n"
+            "• 拼音搜索\n"
             "• 赛博朋克风格可换肤 UI"
         )
         desc.setStyleSheet(

@@ -1,15 +1,34 @@
 """
-可交易物品名称识别器
+[L-Recognizer] ItemNameRecognizer — 可交易物品名称识别器
 
-从截图中 OCR 识别英文物品名 + 中文部件词，
-中文部件词映射为英文后缀，输出纯英文名称。
+从截图中 OCR 识别英文物品名 + 中文部件词,
+中文部件词映射为英文后缀,输出纯英文名称。
+
+依赖: numpy + rapidocr-onnxruntime
+被谁用: core.services.screenshot_pipeline
 
 OCR 纠错策略:
   1. 常见 OCR 混淆字符替换: I↔l↔1, O↔0, S↔5, B↔8, G↔6, Z↔2
   2. 驼峰粘连拆分: ArchonStretch → Archon Stretch
   3. Warframe 专有名词白名单纠错
 
-重构后继承 BaseOCR，匹配逻辑已迁移至 recognizers.matcher。
+重构后继承 BaseOCR,匹配逻辑已迁移至 recognizers.matcher。
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L-Recognizer] (core/recognizers/)
+允许依赖:  numpy, onnxruntime, opencv-python, sqlite3, rapidocr-onnxruntime
+禁止依赖:  core.widgets/* / core.pages/* / core.state/*
+           (不能调 UI,只能输出结构化结果)
+必读规范:  .trae/rules/开发规范.md §6.3
+
+本文件相关红线:
+- 禁止返回 Qt 控件 → 只能返回 dict(含 en_name / zh_name / slug / quality)
+- 禁止阻塞主线程的长任务 → 必须放 QThread/Signal
+- 禁止吞掉 OCR 错误 → 必须 try/except 记录到日志
+- 禁止在 OCR 链路里调网络 API → OCR 是离线识别
+- 禁止 import 整个 core.* → 只 import 同层 (recognizers) 模块
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.3。
 """
 
 import os
@@ -1842,8 +1861,4 @@ class ItemNameRecognizer(BaseOCR):
                 [max(xs), max(ys)], [min(xs), max(ys)]]
 
 
-# ============================================================
-# 向后兼容：重导出匹配函数
-# ============================================================
 
-from core.recognizers.matcher import match_and_translate  # noqa: E402, F401

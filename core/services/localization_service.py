@@ -8,6 +8,22 @@
 所有星球名、任务模式、稀有度、敌人名、掉落类型等术语的中英对照，
 主数据源为 warframe.db 中的 game_translations 表，硬编码值仅作回退。
 首次调用 translate_location() 时懒加载 DB 数据。
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L-Service] (core/services/)
+允许依赖:  Python 标准库 + data/* + core.hotkey_config 等纯模块
+禁止依赖:  PySide6 / QtWidgets / QtGui / QtCore(Signal 除外)
+           core.widgets/* / core.pages/* / core.recognizers/*
+必读规范:  .trae/rules/开发规范.md §6.2
+
+本文件相关红线:
+- 禁止 import PySide6 → Service 是纯逻辑,不能碰 UI
+- 禁止返回 Qt 对象 → 只能返回 dict / list / str / int / bool
+- 禁止在 Service 中发信号调用 widget → 状态走 core.state / EventBus
+- 禁止未捕获的 IO/网络异常冒泡 → 必须 try/except 降级
+- 禁止在 Service 中持有 widget 引用
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.2。
 """
 
 from __future__ import annotations
@@ -15,7 +31,6 @@ from __future__ import annotations
 import logging
 import re as _re
 import sqlite3 as _sqlite3
-from pathlib import Path as _Path
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +192,9 @@ _SUBLOCATION_HARDCODED = {
 # ============================================================
 # 2. 懒加载：首次调用时从 warframe.db 加载 EN→ZH 翻译
 # ============================================================
-_DB_PATH = _Path(__file__).resolve().parent.parent.parent / "data" / "warframe.db"
+# 数据库路径(打包/开发环境自适应,见 core.paths;首启自动复制随包初始库)
+from core.paths import ensure_user_file as _ensure_db_file
+_DB_PATH = _ensure_db_file("warframe.db")
 _DB_LOCALE: dict[str, str] | None = None   # None = 未加载
 
 

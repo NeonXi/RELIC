@@ -1,12 +1,31 @@
 """
-功能模式处理器 —— 从 AppCore 拆分出来的功能处理逻辑。
+[L-Service] core.mode_handlers — 截图功能模式处理器
 
-职责：
-- 出入库状态查询 (_handle_check_status)
-- 遗物内容查询 (_handle_query_parts)
-- 翻译 (_handle_translate)
+从 AppCore 拆分出来的功能处理逻辑(纯函数式),无状态。
 
-所有处理器接收必要的运行时状态作为参数，避免循环依赖。
+职责:
+- 出入库状态查询 (handle_check_status)
+- 遗物内容查询 (handle_query_parts)
+- 中文→英文部件名映射 (_get_merged_cn_to_en, _translate_cn_to_en)
+
+依赖: Python 标准库 + data/ 模块 + core.constants + core.annotation(纯数据类)
+禁止: PySide6 / QtWidgets / QtGui (Signal 除外)
+被谁用: core.services.screenshot_pipeline.py (作为回调), core.services.recognition_pipeline_service.py
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L-Service] (core/ 根目录,跨层桥接/全局管理器)
+允许依赖:  视文件而定(本层可持有 widget 引用作桥接,但不实现绘制)
+禁止依赖:  根目录 .py 不允许做业务实现 → 业务放 core/services/
+必读规范:  .trae/rules/开发规范.md §6.2
+
+本文件相关红线:
+- 禁止根目录 .py 持有 widget 绘制逻辑 → 视觉交给 core/widgets/
+- 禁止硬编码资源路径 → 必须 core.constants 取
+- 禁止在根目录定义业务类 → 业务放对应层
+- 禁止反向调用 UI(从 Service → Widget) → 单向数据流
+- 禁止 try/except: pass 吞错 → 必须记录到日志或抛给上层
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.2,别走捷径。
 """
 
 from typing import Optional
@@ -16,7 +35,6 @@ from core.constants import (
     COLOR_GOLD, COLOR_SILVER, COLOR_COPPER, FALLBACK_COLOR,
 )
 from core.annotation import Annotation
-from core.recognizers.item_name import match_and_translate
 from data.ui_strings import S
 
 
@@ -40,7 +58,6 @@ def strip_refinement(name: str) -> str:
 
 def handle_check_status(last_relics, relic_db, last_region, dpi, overlay):
     """出入库查询：识别遗物 → 标注出入库状态。"""
-    print(f"[诊断-出入库] last_relics={len(last_relics)}, region={last_region}, dpi={dpi}", flush=True)
     annotations = []
 
     for name, box in last_relics:
@@ -48,14 +65,13 @@ def handle_check_status(last_relics, relic_db, last_region, dpi, overlay):
         sx = int(last_region[0] + box[0][0] / dpi)
         sy = int(last_region[1] + box[0][1] / dpi - 28)
         info = relic_db.find(base_name)
-        print(f"[诊断-出入库] name='{name}' -> base='{base_name}' -> info={'有' if info else 'None'}", flush=True)
         if info:
             if info.get('vaulted', False):
                 color, label = COLOR_VAULTED, f"{base_name} [{S('overlay', 'relic_vaulted')}]"
             else:
                 color, label = COLOR_AVAILABLE, f"{base_name} [{S('overlay', 'relic_available')}]"
         else:
-            color, label = COLOR_UNKNOWN, f"{base_name} [?]"
+            color, label = COLOR_UNKNOWN, S.format("overlay", "relic_no_parts_info", name=base_name)
         annotations.append(Annotation.create(label, sx, sy, duration_ms=8000, color=color))
 
     overlay.show_annotations_stream(
@@ -105,7 +121,7 @@ def handle_query_parts(last_relics, relic_db, last_region, dpi, overlay):
     overlay.show_annotations_stream(
         annotations, auto_hide_ms=10000, interval_ms=35, batch_size=1)
 
-    return matched, total, unmatched_names
+    return matched, len(last_relics), unmatched_names
 
 
 def _map_rarity_colors(chances, sorted_parts):
@@ -128,433 +144,204 @@ def _map_rarity_colors(chances, sorted_parts):
 
 
 # ================================================================
-# 翻译
+# 中文→英文部件名映射（反向自 data/wfinfo_relics._PRIME_PART_SUFFIXES）
+# ================================================================
+#  部件后缀字典（DB 驱动 + 手动补充）
+#  用途: 空格修复时识别已知部件名 / 中文→英文翻译
 # ================================================================
 
-def handle_translate(last_items, last_region, dpi, overlay):
-    """翻译：OCR 文本 → 匹配数据库 → 标注中文名。"""
-    if not last_items:
-        overlay.display(S("overlay", "no_text_detected"), auto_hide_ms=3000)
-        return
+def _load_part_suffix_dict() -> dict[str, str]:
+    """从 game_translations 表加载 Prime 部件后缀的 {中文:英文} 映射。
 
-    translated = match_and_translate(last_items)
-    if not translated:
-        overlay.display(S("overlay", "translate_failed"), auto_hide_ms=3000)
-        return
-
-    annotations = []
-    print(f"[显示-翻译] ===== 渲染 {len(translated)} 条翻译标注 =====", flush=True)
-    for item in translated:
-        en_name = item.get('en_name', item.get('ocr_text', ''))
-        zh_name = item.get('zh_name', '')
-        quality = item.get('match_quality', 'none')
-        box = item['box']
-        sx = int(last_region[0] + box[0][0] / dpi)
-        sy = int(last_region[1] + box[0][1] / dpi - 28)
-
-        if quality == 'exact':
-            color = COLOR_AVAILABLE
-        elif quality in ('prefix', 'contains'):
-            color = COLOR_VAULTED
-        else:
-            color = COLOR_UNKNOWN
-
-        label = S.format("overlay", "translate_label_fmt", zh_name=zh_name, en_name=en_name) if (zh_name and zh_name != en_name) else en_name
-
-        print(f"[显示-翻译] OCR=\"{item.get('ocr_text')}\" | 匹配=\"{en_name}\" | zh=\"{zh_name}\" | "
-              f"quality={quality} | 坐标=({sx},{sy}) | 显示文字=\"{label}\"", flush=True)
-
-        annotations.append(Annotation.create(label, sx, sy, duration_ms=10000, color=color))
-
-    overlay.show_annotations_stream(
-        annotations, auto_hide_ms=10000, interval_ms=35, batch_size=1)
-
-    matched = sum(1 for t in translated if t.get('match_quality', 'none') != 'none')
-    overlay.display(
-        S.format("overlay", "translate_summary", total=len(translated), matched=matched),
-        auto_hide_ms=6000)
-
-    return len(translated), matched
-
-
-# ================================================================
-# 价格查询（CTRL+T）
-# ================================================================
-
-# 价格查询专用噪声过滤（不影响遗物识别的 TextCorrector）
-_PRICE_NOISE = set("|\\/=[]【】\"',.=-~!()<>{}@#$%^&*")
-_PRICE_JUNK_RE = re.compile(r'^[0-9OoIil]+$')  # 纯数字/形近字 → 丢弃
-
-
-def _clean_price_items(ocr_results: list) -> list[dict]:
-    """价格查询专用轻量清洗：只做基础清理，不做激进字符替换。
-
-    与 TextCorrector 的区别：
-    - 不做 s→5, l→1, O→0 等无差别字符替换
-    - 只做基础去噪和 Warframe 常见词修复
-    - 保留 OCR 原始识别结果
-    """
-    results = []
-    for text, box, score in ocr_results:
-        # 基础清洗
-        cleaned = text.strip()
-        cleaned = ''.join(ch for ch in cleaned if ch not in _PRICE_NOISE)
-        cleaned = re.sub(r' {2,}', ' ', cleaned).strip()
-
-        # 过滤纯数字/垃圾
-        if not cleaned or _PRICE_JUNK_RE.match(cleaned):
-            continue
-
-        results.append({
-            'original': text,
-            'corrected': cleaned,
-            'item_name': cleaned,
-            'box': box,
-            'score': score,
-        })
-    return results
-
-
-def handle_query_price(
-    ocr_results: list,
-    last_region: tuple,
-    dpi: float,
-    overlay,
-):
-    """价格查询：OCR 识别 → 纠错 → WM API 查询 → 显示前 10 个最低价。
-
-    Args:
-        ocr_results: OCR 识别结果列表 [(text, box, score), ...]
-        last_region: 截图区域 (left, top, right, bottom)
-        dpi: DPI 缩放比例
-        overlay: Overlay 实例
-    """
-    from core.services.market_price_service import MarketPriceService, get_market_price_service
-    from core.annotation import Annotation
-    from data.ui_strings import S
-    from core.constants import COLOR_GOLD, COLOR_AVAILABLE, COLOR_UNKNOWN
-
-    if not ocr_results:
-        overlay.display(S("overlay", "no_text_detected"), auto_hide_ms=3000)
-        return
-
-    # ---- Step 1: 价格查询专用轻量清洗（不破坏原始 OCR 结果） ----
-    # 注意：这里不用 TextCorrector（那是遗物识别的纠错逻辑，含 s→5 等激进映射）
-    items_to_query = _clean_price_items(ocr_results)
-    if not items_to_query:
-        overlay.display(S("overlay", "translate_failed"), auto_hide_ms=3000)
-        return
-
-    print(f"[价格查询] 提取到 {len(items_to_query)} 个物品: "
-          f"{[i['item_name'] for i in items_to_query]}", flush=True)
-
-    # ---- Step 2: 查询 WM API 价格 ----
-    svc = get_market_price_service()
-    price_annotations = []
-    query_count = 0
-
-    for item in items_to_query:
-        item_name = item['item_name']
-        box = item['box']
-
-        # 计算标注位置（框的上方）
-        sx = int(last_region[0] + min(p[0] for p in box) / dpi)
-        sy = int(last_region[1] + min(p[1] for p in box) / dpi - 28)
-
-        try:
-            # 尝试将物品名转换为 slug（简化版：直接用名称查询）
-            url_name = _item_name_to_slug(item_name)
-
-            if not url_name:
-                # 无法转换 slug，显示未找到提示
-                label = f"{item_name}\n{S('overlay', 'item_no_match_fmt', ocr_text=item_name)}"
-                price_annotations.append(
-                    Annotation.create(label, sx, sy, duration_ms=10000, color=COLOR_UNKNOWN)
-                )
-                continue
-
-            # 查询价格
-            query_count += 1
-            price_data = svc.query_price(url_name)
-
-            if not price_data or not price_data.get('top10'):
-                # 无价格数据
-                label = f"{item_name}\n{S('overlay', 'item_no_price_fmt', display_name=item_name)}"
-                price_annotations.append(
-                    Annotation.create(label, sx, sy, duration_ms=10000, color=COLOR_UNKNOWN)
-                )
-                continue
-
-            # 格式化价格标注（显示前 10 个 ingame 卖家）
-            top10 = price_data['top10'][:10]
-            lines = [_format_price_header(item_name, price_data)]
-            for i, seller in enumerate(top10[:5], 1):  # 先显示前 5 个
-                lines.append(f"  {i}. {seller['platinum']}p x{seller['quantity']} @{seller['ingame_name']}")
-
-            if len(top10) > 5:
-                lines.append(f"  ... 还有 {len(top10)-5} 个卖家")
-
-            label = '\n'.join(lines)
-            color = COLOR_GOLD if price_data['min_price'] < 20 else COLOR_AVAILABLE
-            price_annotations.append(
-                Annotation.create(label, sx, sy, duration_ms=12000, color=color)
-            )
-
-        except Exception as e:
-            print(f"[价格查询] {item_name} 查询失败: {e}", flush=True)
-            label = f"{item_name}\n查询异常"
-            price_annotations.append(
-                Annotation.create(label, sx, sy, duration_ms=8000, color=COLOR_UNKNOWN)
-            )
-
-    # ---- Step 3: 显示标注 ----
-    if price_annotations:
-        overlay.show_annotations_stream(
-            price_annotations, auto_hide_ms=12000, interval_ms=40, batch_size=1
-        )
-
-        summary = S.format("overlay", "price_query_summary",
-                           total=len(items_to_query), queried=query_count,
-                           results=len(price_annotations))
-        overlay.display(summary, auto_hide_ms=8000)
-    else:
-        overlay.display(S("overlay", "no_price_data"), auto_hide_ms=4000)
-
-
-def _item_name_to_slug(item_name: str) -> Optional[str]:
-    """将物品名转换为 warframe.market slug。
-
-    基于数据库模糊匹配：
-      - 将 OCR 文本拆分为关键词（中文字符 + 英文单词）
-      - 在 market_items 表中查找包含最多关键词的物品
-      - 返回最佳匹配的 slug
-
-    Args:
-        item_name: OCR 识别文本（可能乱序，如 "蓝图 Ash Prime 系统"）
-
-    Returns:
-        URL slug 或 None
-    """
-    if not item_name:
-        return None
-
-    matched = _fuzzy_match_from_db(item_name)
-    if matched:
-        print(f"[价格查询] 模糊匹配: \"{item_name}\" → \"{matched['name']}\" "
-              f"(slug={matched['slug']}, score={matched['score']:.2f})", flush=True)
-        return matched['slug']
-
-    # DB 无匹配时回退到简单转换
-    slug = item_name.lower()
-    slug = slug.replace("'", "")
-    slug = slug.replace(" & ", "_")
-    slug = slug.replace("&", "")
-    slug = slug.replace(" ", "_")
-    while "__" in slug:
-        slug = slug.replace("__", "_")
-    return slug.strip("_")
-
-
-def _fuzzy_match_from_db(ocr_text: str) -> Optional[dict]:
-    """基于数据库的模糊匹配：从 OCR 乱序文本找到正确的遗物物品名和 slug。
-
-    数据源：relic_rewards 表（遗物内含物品）
-    算法：
-      1. 将 OCR 文本拆分为关键词 token
-      2. 从 relic_rewards 加载所有唯一物品名
-      3. 对每个候选计算关键词覆盖率
-      4. 返回最佳匹配的物品名 + 自动生成的 slug
-
-    Args:
-        ocr_text: OCR 原始文本（如 "蓝图 Ash Prime 系统"）
-
-    Returns:
-        {'name': str, 'slug': str, 'score': float} 或 None
+    数据源: game_translations 表中 relic_rewards.item_name 出现过的部件后缀。
+    运行时只查一次，结果缓存为模块级变量。
     """
     import sqlite3
-
-    tokens = _tokenize_ocr(ocr_text)
-    if not tokens or len(tokens) < 2:
-        return None
-
     db_path = _find_db_path()
     if not db_path:
-        return None
+        return {}
 
+    conn = sqlite3.connect(db_path)
     try:
-        conn = sqlite3.connect(str(db_path))
-        cur = conn.cursor()
+        rows = conn.execute(
+            "SELECT DISTINCT item_name FROM relic_rewards WHERE item_name != ''"
+        ).fetchall()
+        en_names = [r[0] for r in rows]
+        if not en_names:
+            return {}
 
-        # ★ 从 relic_rewards 查询所有唯一遗物物品名
-        cur.execute("""
-            SELECT DISTINCT item_name
-            FROM relic_rewards
-            WHERE item_name IS NOT NULL AND item_name != ''
-              AND item_name NOT LIKE '%Kuva%'
-              AND item_name NOT LIKE '%Forma%'
-        """)
-        candidates = [r[0] for r in cur.fetchall()]
+        placeholders = ','.join('?' * len(en_names))
+        gt_rows = conn.execute(
+            f"SELECT en, zh FROM game_translations WHERE en IN ({placeholders})",
+            en_names,
+        ).fetchall()
+
+        result: dict[str, str] = {}
+        for en, zh in gt_rows:
+            # 提取 "Prime" 之后的部分作为部件后缀
+            # "Acceltra Prime Barrel" → "Barrel"
+            # "Titania Prime Neuroptics Blueprint" → "Neuroptics Blueprint"
+            prime_idx = en.find(' Prime ')
+            if prime_idx >= 0:
+                suffix_en = en[prime_idx + 7:]  # 跳过 " Prime "
+                result[zh] = suffix_en
+
+                # 拆分复合后缀注册子串（启发式按字符数比例）
+                sub_parts = suffix_en.split()
+                if len(sub_parts) >= 2:
+                    for i, sub_en in enumerate(sub_parts):
+                        ratio = len(sub_en) / max(len(suffix_en), 1)
+                        zh_start = int(len(zh) * sum(len(sub_parts[j]) for j in range(i)) / len(suffix_en))
+                        zh_end = zh_start + int(len(zh) * ratio)
+                        if 0 <= zh_start < zh_end <= len(zh):
+                            sub_zh = zh[zh_start:zh_end]
+                            if sub_zh and sub_zh not in result:
+                                result[sub_zh] = sub_en
+        return result
+    finally:
         conn.close()
 
-        if not candidates:
-            print(f"[价格查询] 遗物表无数据", flush=True)
-            return None
 
-        best_match = None
-        best_score = 0.0
-
-        ocr_lower = ocr_text.lower()
-        merged_tokens = _merge_chinese_tokens(tokens)
-        merged_set = set(t.lower() for t in merged_tokens)
-
-        for item_name in candidates:
-            name_lower = item_name.lower()
-
-            # 关键词覆盖率
-            matched = sum(1 for t in merged_set if t in name_lower)
-            coverage = matched / max(len(merged_set), 1)
-
-            # 字符级覆盖度
-            chars_in_ocr = sum(1 for c in name_lower if c in ocr_lower)
-            char_ratio = chars_in_ocr / max(len(name_lower), 1)
-
-            score = coverage * 0.6 + char_ratio * 0.4
-
-            if score > best_score and coverage >= 0.35:
-                best_score = score
-                best_match = {
-                    'name': item_name,
-                    'slug': _name_to_slug_simple(item_name),
-                    'score': score,
-                }
-
-        return best_match
-
-    except Exception as e:
-        print(f"[价格查询] 模糊匹配 DB 错误: {e}", flush=True)
-        return None
+_part_suffix_cache: dict[str, str] | None = None
 
 
-def _name_to_slug_simple(name: str) -> str:
-    """简单 slug 生成（与 WM API 规则一致）。"""
-    if not name:
-        return ''
-    slug = name.lower().replace("'", "").replace(" & ", "_").replace("&", "")
-    slug = slug.replace(" ", "_").replace("-", "_")
-    while "__" in slug:
-        slug = slug.replace("__", "_")
-    return slug.strip("_")
+def _get_part_suffixes() -> dict[str, str]:
+    """获取部件后缀字典（懒加载单例）。"""
+    global _part_suffix_cache
+    if _part_suffix_cache is None:
+        _part_suffix_cache = _load_part_suffix_dict()
+    return _part_suffix_cache
 
 
-def _merge_chinese_tokens(tokens: list[str]) -> list[str]:
-    """合并相邻的中文字符为词组。
+# ── 手动补充的部件映射（DB 未覆盖或需覆盖的场景）──
+_CN_TO_EN_PARTS: dict[str, str] = {
+    '头部神经光元蓝图': 'Neuroptics Blueprint',
+    '机体蓝图':     'Chassis Blueprint',
+    '系统蓝图':     'Systems Blueprint',
+    '蓝图':         'Blueprint',
+    '系统':         'Systems',
+    '机体':         'Chassis',
+    '头部神经光元':  'Neuroptics',
+    '头部':         'Cerebrum',
+    '外壳':         'Carapace',
+    '枪管':         'Barrel',
+    '枪机':         'Receiver',
+    '枪托':         'Stock',
+    '连接器':       'Link',
+    '握柄':         'Handle',
+    '刀刃':         'Blade',
+    '爪刃':         'Blades',
+    '拳套':         'Gauntlet',
+    '手套':         'Gauntlet',
+    '饰物':         'Ornament',
+    '锤头':         'Head',
+    '弓身':         'Grip',
+    '弓弦':         'String',
+    '弹袋':         'Pouch',
+    '链刃':         'Chain',
+}
 
-    ["蓝", "图", "Ash", "Prime", "系", "统"]
-    → ["蓝图", "Ash", "Prime", "系统"]
+
+def _get_merged_cn_to_en() -> dict[str, str]:
+    """返回手动映射 + DB 驱动数据的合并字典（手动优先）。"""
+    merged = dict(_CN_TO_EN_PARTS)
+    for cn, en in _get_part_suffixes().items():
+        if cn not in merged:
+            merged[cn] = en
+    return merged
+
+# ── 中文名称 → 英文名称（Prime 战甲/武器本体）──
+# 这些是游戏中文本地化的 Prime 角色名，OCR 可能识别出中文名
+_CN_TO_EN_NAMES: dict[str, str] = {
+    # 战甲 (Warframes)
+    '陨蜓':       'Caliban',
+    '灰烬':       'Ash',
+    '阿特拉斯':   'Atlas',
+    '班恩':       'Banshee',
+    '牛甲':       'Rhino',
+    '伏特':       'Volt',
+    '喵喵板':     'Valkyr',
+    '核热':       'Frost',
+    '磁妹':       'Mag',
+    '圣剑':       'Excalibur',
+    '超能新星':   'Nova',
+    '小丑':       'Loki',
+    '奶妈':       'Trinity',
+    '猴子':       'Wukong',
+    '沙甲':       'Inaros',
+    '水雷':       'Harrow',
+    '玻璃':       'Gara',
+    '草泥马':     'Khora',
+    '夜灵':       'Revenant',
+    '永续':       'Garuda',
+    '多边形':     'Baruuk',
+    '哈丘':       'Hildryn',
+    '赛德娜':     'Wisp',
+    '夜幕':       'Xaku',
+    '瑟图斯':     'Sevagoth',
+    '圣装':       '',  # 前缀标记，不翻译
+    '圣装 ':      '',
+    # 武器 (Weapons) - 常见简称/译名
+    '卡帕压力枪': 'Cappa',
+    '阿克斯特莱托': 'Akstiletto',
+    '布拉顿':     'Braton',
+    '伯斯顿':     'Burston',
+    '达克拉':     'Dakra',
+    '加拉廷':     'Galatine',
+    '格拉姆':     'Gram',
+    '拉特龙':     'Latron',
+    '雷克斯':     'Lex',
+    '索玛':       'Soma',
+    '塔苏':       'Tatsu',
+    '托里德':     'Torid',
+    '瓦斯托':     'Vasto',
+    # 弓类 / 补充武器（OCR 常见中文名）
+    '大久和弓':   'Daikyu',
+    '巴黎':       'Paris',
+    '恐惧':       'Dread',
+    '科林斯':     'Corinth',
+    '拉特昂':     'Latron',      # OCR 变体: 拉特龙/拉特昂
+}
+
+
+def _translate_cn_to_en(text: str) -> str:
+    """将 OCR 中文游戏 UI 文本中的中文部件名/角色名替换为英文。
+
+    将中文 OCR 输出转换为接近 DB 英文名的格式，
+    供识别管线后续匹配使用。
+
+    Args:
+        text: OCR 文本（建议先做空格修复）
+
+    Returns:
+        部分或全部翻译为英文的文本
     """
-    result = []
-    i = 0
-    while i < len(tokens):
-        t = tokens[i]
-        if len(t) == 1 and '\u4e00' <= t <= '\u9fff':
-            # 中文字符：向后合并连续中文
-            merged = t
-            j = i + 1
-            while j < len(tokens) and len(tokens[j]) == 1 and '\u4e00' <= tokens[j] <= '\u9fff':
-                merged += tokens[j]
-                j += 1
-            result.append(merged)
-            i = j
-        else:
-            result.append(t)
-            i += 1
-    return result
-
-
-def _tokenize_ocr(text: str) -> list[str]:
-    """将 OCR 文本拆分为关键词 token。
-
-    规则：
-      - 中文逐字拆分（每个汉字一个 token）
-      - 英文按空格拆分为单词
-      - 过滤单字符噪声（纯数字/标点）
-      - 过滤常见停用词
-
-    Examples:
-        "蓝图 Ash Prime 系统" → ["蓝图", "Ash", "Prime", "系统"]
-        "Atlas Prime 机体 蓝图" → ["Atlas", "Prime", "机体", "蓝图"]
-    """
-    import re
-
-    text = text.strip()
     if not text:
-        return []
+        return ''
 
-    # 停用词（OCR 常见但无意义的词/字）
-    STOP_WORDS = {'o', '0', 'l', 'i', '|', '-', '_', 'x', 'a'}
+    result = text
 
-    tokens = []
-    current_word = []
-    is_chinese_phase = False
+    # ★ 顺序关键：先翻译武器/战甲本体名，再翻译部件词
+    # 原因: 部件词(如"弓""头""管")是武器名的子串，
+    #       若先替换部件词，武器名("大久和弓")会被破坏
 
-    for ch in text:
-        if '\u4e00' <= ch <= '\u9fff' or '\u3000' <= ch <= '\u303f':
-            # 中文字符：如果之前有英文单词，先保存
-            if current_word:
-                word = ''.join(current_word).strip()
-                if word and len(word) > 1 and word.lower() not in STOP_WORDS:
-                    tokens.append(word)
-                current_word = []
-            tokens.append(ch)  # 中文逐字
-            is_chinese_phase = True
-        elif ch.isalpha() or ch == "'":
-            current_word.append(ch)
-            is_chinese_phase = False
-        elif ch.isspace():
-            if current_word:
-                word = ''.join(current_word).strip()
-                if word and len(word) > 1 and word.lower() not in STOP_WORDS:
-                    tokens.append(word)
-                current_word = []
-        else:
-            # 数字或符号：作为分隔符处理
-            if current_word:
-                word = ''.join(current_word).strip()
-                if word and len(word) > 1 and word.lower() not in STOP_WORDS:
-                    tokens.append(word)
-                current_word = []
+    # 1. 替换中文名称（角色/武器名）—— 先执行，保护长词完整性
+    for cn, en in sorted(_CN_TO_EN_NAMES.items(), key=lambda x: -len(x[0])):
+        if cn and en:
+            result = result.replace(cn, en)
+        elif cn and not en:
+            result = result.replace(cn, '')
 
-    # 处理末尾残留
-    if current_word:
-        word = ''.join(current_word).strip()
-        if word and len(word) > 1 and word.lower() not in STOP_WORDS:
-            tokens.append(word)
+    # 2. 替换复合部件词（长词优先，使用 DB+手动合并字典）
+    for cn, en in sorted(_get_merged_cn_to_en().items(), key=lambda x: -len(x[0])):
+        result = result.replace(cn, en)
 
-    return tokens
+    # 3. ★ 修复翻译后英文单词粘连：在两个大写单词间补空格
+    #    例: "CerebrumNeuroptics" → "Cerebrum Neuroptics"
+    result = re.sub(r'([a-z])([A-Z])', r'\1 \2', result)
 
+    # 4. 清理多余空格
+    result = re.sub(r' {2,}', ' ', result).strip()
 
-def _find_db_path() -> Optional[Path]:
-    """查找项目数据库文件路径。"""
-    from pathlib import Path
-
-    candidates = [
-        Path('data/warframe.db'),
-        Path('data/relic_data.db'),
-    ]
-    for p in candidates:
-        if p.exists():
-            return p.resolve()
-    return None
-
-
-def _format_price_header(item_name: str, price_data: dict) -> str:
-    """格式化价格标题行。"""
-    from data.ui_strings import S
-
-    min_p = price_data.get('min_price', 0)
-    avg_p = price_data.get('avg_price', 0)
-    total_ingame = price_data.get('total_ingame', 0)
-
-    return (f"{item_name} [{S('overlay', 'price_ingame_sellers', count=total_ingame)}]\n"
-            f"  最低 {min_p}p | 均价 {avg_p:.1f}p")
+    return result
 

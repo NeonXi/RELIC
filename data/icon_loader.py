@@ -2,14 +2,16 @@
 WARFRAME-RELIC 图标加载器
 
 支持多种图标格式：
-1. Unicode Emoji 图标（内置）
-2. SVG 图标文件
-3. 自定义字体图标
-4. PNG 图标文件
+1. 内置 SVG 图标文件(assets/icons/)
+2. Unicode Emoji 图标(内置 fallback)
 
-图标文件搜索路径：
-1. project_root/icon/ - 用户自定义图标库（Unoline）
-2. project_root/assets/icons/ - 内置图标目录
+图标文件搜索路径(只用一套):
+  - project_root/assets/icons/ - 项目内置 SVG 图标
+
+注意:
+  - 旧版本曾支持 icon/unoline-icons/ 第三方图标库,已移除
+  - 旧库目录保留在仓库但不再被加载(避免误用)
+  - 如果以后需要扩展图标库,在 _get_icon_search_paths() 中追加路径即可
 """
 
 import os
@@ -17,61 +19,60 @@ from pathlib import Path
 
 # 图标资源目录
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_ASSETS_DIR = _PROJECT_ROOT / 'assets'
-_BUILTIN_ICONS_DIR = _ASSETS_DIR / 'icons'
-_CUSTOM_ICONS_DIR = _PROJECT_ROOT / 'icon'
+_BUILTIN_ICONS_DIR = _PROJECT_ROOT / 'assets' / 'icons'
 
 # ============================================================
 # 图标映射配置
-# 将项目内部图标 ID 映射到图标文件名
-# 使用 unoline-icons 图标库
+# 将项目内部图标 ID 映射到 assets/icons/ 下的 SVG 文件名
+# 命名风格: nav_xxx / action_xxx / platform_xxx
 # ============================================================
 ICON_MAPPINGS = {
     "nav": {
-        "toggles":     "hard drive",   # 功能开关 - 硬盘图标代表功能模块
-        "status":      "profile",      # 数据状态 - 个人资料图标代表状态信息
-        "db_center":       "reload_right", # 数据管理 - 刷新图标代表数据库管理
-        "trans":       "mail",         # 翻译库 - 邮件图标代表语言转换
-        "items":       "search",       # 物品查询 - 搜索图标
-        "prices":      "card",         # 价格数据 - 卡片图标代表价格
-        "hotkeys":     "write",        # 快捷键 - 写入图标代表配置编辑
-        "theme":       "smartphone",   # 主题换肤 - 手机图标代表外观定制
-        "preset":      "notebook",     # 语言预设 - 笔记本图标代表文案配置
-        "about":       "message",      # 关于 - 消息图标代表信息
-        "reset":       "shield",       # 紧急重置 - 盾牌图标代表安全保护
+        # 实际存在的图标
+        "toggles":     "nav_toggles",     # 功能开关
+        "status":      "nav_status",      # 数据状态
+        "db_overview": "nav_db_center",   # 数据总览(复用 db_center 命名)
+        "trans":       "nav_trans",       # 翻译库(预留)
+        "items":       "nav_items",       # 物品查询
+        "prices":      "nav_prices",      # 价格数据
+        "hotkeys":     "nav_hotkeys",     # 快捷键
+        "theme":       "nav_theme",       # 主题换肤
+        "about":       "nav_about",       # 关于
+        "reset":       "nav_reset",       # 紧急重置
     },
     "action": {
-        "check_status": "folder",      # 出入库查询 - 文件夹图标代表状态检查
-        "query_parts":  "notebook",    # 遗物内容查询 - 笔记本图标代表详细记录
-        "query_price":  "battery",     # 价格查询 - 电池图标代表能量/价值
-        "translate":    "time",        # 翻译 - 时间图标代表转换过程
+        "check_status": "action_check_status",  # 出入库查询
+        "query_parts":  "action_query_parts",   # 遗物内容查询
+        "translate":    "action_translate",     # 翻译
     },
     "platform": {
-        "bilibili":    "message",      # B站 - 使用消息图标作为视频平台替代
-        "github":      "Github",       # GitHub
+        "bilibili":    "platform_bilibili",     # B站
+        "github":      "platform_github",       # GitHub
     }
 }
 
 # ============================================================
-# 内置图标（作为 fallback）
+# Emoji fallback(无对应 SVG 时使用,作为文本显示)
 # ============================================================
 FALLBACK_ICONS = {
     "nav": {
         "toggles":     "⚙",
         "status":      "📊",
-        "db_center":       "🔄",
+        "db_overview": "🔄",
         "trans":       "🌐",
         "items":       "🔍",
         "prices":      "💰",
         "hotkeys":     "⌨",
         "theme":       "🎨",
+        "preset":      "🗒",  # 暂无 nav_preset.svg,走 emoji
+        "triggers":    "⚡",  # 暂无 nav_triggers.svg,走 emoji
+        "eye_mask":    "🛡",  # 暂无 nav_eye_mask.svg,走 emoji
         "about":       "ℹ",
         "reset":       "[!]",
     },
     "action": {
         "check_status": "⊞",
         "query_parts":  "◎",
-        "query_price":  "⟐",
         "translate":    "⬢",
     },
     "platform": {
@@ -81,23 +82,14 @@ FALLBACK_ICONS = {
 }
 
 # ============================================================
-# 图标文件搜索路径（按优先级排序）
+# 图标文件搜索路径(按优先级排序)
 # ============================================================
 def _get_icon_search_paths() -> list:
-    """获取图标文件搜索路径列表"""
+    """获取图标文件搜索路径列表(只用内置目录)"""
     paths = []
-    
-    # 1. 用户自定义图标库（Unoline）
-    unoline_dir = _CUSTOM_ICONS_DIR / 'unoline-icons' / 'Unoline'
-    if unoline_dir.exists():
-        paths.append(unoline_dir / 'Essentials')
-        paths.append(unoline_dir / 'Navigation')
-        paths.append(unoline_dir / 'Social')
-    
-    # 2. 内置图标目录
+    # 1. 内置图标目录
     if _BUILTIN_ICONS_DIR.exists():
         paths.append(_BUILTIN_ICONS_DIR)
-    
     return paths
 
 # ============================================================

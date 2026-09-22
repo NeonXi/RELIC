@@ -11,7 +11,22 @@
   - 掉落途径（自动中文化）
 
 数据源: warframe.db → ItemService.get_relic_contents() / get_relic_drop_locations()
+
+## AI 硬约束 — 修改本文件前必读
+归属层:    [L2] (core/pages/)
+允许依赖:  core.widgets/*, core.services/*(读), PySide6
+禁止依赖:  core.tokens/* 直接调用(只能间接), 任何反向依赖 widgets
+必读规范:  .trae/rules/开发规范.md §6.5
+
+本文件相关红线:
+- ✗ 禁止 setStyleSheet(f"...") → 必须用 Token 或继承自 CyberWidget
+- ✗ 禁止重写 paintEvent → 视觉交给 Widget
+- ✗ 禁止遗物数据加载在 Page 内实现 → 走 Service
+- ✗ 禁止硬编码颜色 / 尺寸 → 必须 token / space
+
+OPTIONS: 有疑义先读 .trae/rules/开发规范.md §6.5,别走捷径。
 """
+
 
 from __future__ import annotations
 
@@ -89,6 +104,7 @@ class RelicsPage(PageBase):
         self._suggest_timer.timeout.connect(self._on_suggest_trigger)
 
     def build_content(self) -> QWidget:
+        """构建遗物内容查询页(遗物选择 + 部件概率表)。"""
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(
@@ -100,17 +116,18 @@ class RelicsPage(PageBase):
         # ── 标题 ──
         title = QLabel(self._copy("relics.title", "遗物检索"))
         title.setFont(QFont("Iceberg", self._font_size("lg_xl", 18)))
-        accent = self._color("accent.primary")
-        title.setStyleSheet(f"color: {accent}; padding: 4px 0;")
+        self._style(title, color="accent.primary", padding=("4px", "0"))
         layout.addWidget(title)
 
         desc = QLabel(
             self._copy("relics.desc",
                        "查询遗物内含 Prime 部件、出入库状态及掉落途径")
         )
-        desc.setStyleSheet(
-            f"color: {self._color('text.tertiary')}; "
-            f"font-size: {self._font_size('sm', 12)}px; padding: 0 0 12px 0;"
+        self._style(
+            desc,
+            color="text.tertiary",
+            font_size="sm",
+            padding=("0", "0", "12px", "0"),
         )
         layout.addWidget(desc)
 
@@ -180,27 +197,31 @@ class RelicsPage(PageBase):
         accent = self._color("accent.primary")
         _subtle_border = TokenManager.instance().get_qcolor("border.subtle")
 
-        self._result_list.setStyleSheet(f"""
-            QListWidget {{
-                background-color: transparent;
-                border: none;
-                outline: none;
-                font-size: {self._font_size('sm_md', 13)}px;
-            }}
-            QListWidget::item {{
-                color: {self._color('text.primary')};
-                padding: {self._spacing('spacing.sm', 10)}px {self._spacing('spacing.md', 12)}px;
-                border-bottom: 1px solid rgba({_subtle_border.red()}, {_subtle_border.green()}, {_subtle_border.blue()}, 0.05);
-                border-radius: {self._spacing('corner.xs', 4)}px;
-            }}
-            QListWidget::item:selected {{
-                background-color: {list_bg_hover};
-                color: {accent};
-            }}
-            QListWidget::item:hover {{
-                background-color: {list_bg_hover};
-            }}
-        """)
+        # 复杂 QSS(多选择器 + rgba)走 raw 通道
+        self._style(
+            self._result_list,
+            raw=(
+                f"QListWidget {{"
+                f"  background-color: transparent;"
+                f"  border: none;"
+                f"  outline: none;"
+                f"  font-size: {self._font_size('sm_md', 13)}px;"
+                f"}}"
+                f"QListWidget::item {{"
+                f"  color: {self._color('text.primary')};"
+                f"  padding: {self._spacing('spacing.sm', 10)}px {self._spacing('spacing.md', 12)}px;"
+                f"  border-bottom: 1px solid rgba({_subtle_border.red()}, {_subtle_border.green()}, {_subtle_border.blue()}, 0.05);"
+                f"  border-radius: {self._spacing('corner.xs', 4)}px;"
+                f"}}"
+                f"QListWidget::item:selected {{"
+                f"  background-color: {list_bg_hover};"
+                f"  color: {accent};"
+                f"}}"
+                f"QListWidget::item:hover {{"
+                f"  background-color: {list_bg_hover};"
+                f"}}"
+            ),
+        )
         self._result_list.setMinimumHeight(300)
         self._result_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 

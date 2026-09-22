@@ -9,7 +9,6 @@ STRINGS = {
     "button": {
         "mode_check":      "查状态",
         "mode_query":      "查部件",
-        "mode_price":      "查价格",
         "mode_translate":  "翻译",
     },
 
@@ -35,9 +34,7 @@ STRINGS = {
         "selection_status_idle":   "",
         "selection_status_released": "",
         "mode_selected":           "已选择功能: {mode}",
-        "price_query_summary":     "价格查询完成: 共 {total} 项, 查询 {queried} 项, 结果 {results} 条",
-        "price_ingame_sellers":    "{count} 位在线卖家",
-        "no_price_data":           "未获取到价格数据",
+        "relic_no_parts_info":     "【{name}】无数据",
         "region_saved":            "区域已保存: ({l},{t})-({r},{b}) {w}x{h}",
     },
 
@@ -45,7 +42,6 @@ STRINGS = {
     "hotkey": {
         "label_select":       "区域选择",
         "label_fullscreen":   "全屏捕获",
-        "label_query_price":  "查询价格",
         "label_eye_mask":     "护眼遮罩",
     },
 
