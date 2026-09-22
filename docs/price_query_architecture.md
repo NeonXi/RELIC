@@ -167,6 +167,11 @@ class QuerySubStatus(str, Enum):
 - **子状态独立**：搜索/查询的子状态不影响顶层状态
 - **DEGRADED 含义**：列表加载失败,但 DB 可用 → 走 DB 阶段搜索
 - **30s 冷却**：失败后 30s 内不再自动重试,需用户点"重试"按钮
+- **LOADING 期搜索放行**（打包实测修正）：顶层为 LOADING 时输入不提示"列表不可用"——
+  coordinator 自动重试列表加载,失败即降级 DB 中文搜索,预选项正常出现;
+  仅 `IDLE|FAILED` 显示「列表不可用,无法搜索」
+- **启动预热**（打包实测修正）：预热不在 `on_enter`(用户进页面才拉,首启必撞 10-40s
+  网络超时白等),改为**页面创建后 15s 后台预热**——用户还在逛别的页面时列表已就绪
 
 ---
 
@@ -444,7 +449,8 @@ class PricesPage(PageBase):
         PriceQueryState.instance().query_failed.connect(self._on_query_failed)
     
     def on_enter(self) -> None:
-        """进入页面:启动异步预热。"""
+        """进入页面:未就绪则补一次异步预热(兜底;
+        主预热在页面创建后 15s 由 QTimer 自动触发,见 §3.3)。"""
         WmItemsRepository.instance().warm_cache_async()
     
     def _on_top_status(self, status: str) -> None:

@@ -1,8 +1,8 @@
 # WARFRAME-RELIC 打包 EXE 方案
 
-> 状态:待审阅(用户确认后才执行实施)
-> 日期:2026-09-22
-> 关联:旧打包产物已按用户要求清理(见 §2)
+> 状态:**P1 ✅ P2 ✅ P3 ✅(用户实测功能正常)· P4(干净机器)待验证**
+> 日期:2026-09-22 · 最新产物:`dist/WARFRAME-RELIC_win64_20260922.zip`(176 MB)
+> 关联:旧打包产物已按用户要求清理(见 §2)· 执行记录见 §9
 
 ---
 
@@ -81,8 +81,8 @@ def _compute_json_path() -> Path:
 | 写入问题 | 可控(本方案治理) | 临时目录退出即毁,无解 |
 | 分享方式 | 打成 zip/7z 一个压缩包 | 单文件 |
 
-分享给别人的最终交付物:`WARFRAME-RELIC_vX.Y.zip`,解压即用。
-控制台窗口**保留**(符合你偏好 CMD 日志,也便于排错;脚本留 `--no-console` 选项)。
+分享给别人的最终交付物:`WARFRAME-RELIC_win64_日期.zip`,解压即用。
+控制台窗口**不显示**(用户决策:`--windowed` 只显示软件窗口);崩溃日志走 `data/logs/console.log`(dev.py frozen 兜底,见 §9)。
 
 ### 4.2 路径治理(核心):新建 `core/paths.py`
 
@@ -128,12 +128,12 @@ user_data_dir() → exe 旁 data/;写入失败自动降级 %LOCALAPPDATA%\WARFRA
 
 ## 5. 实施分期(每期独立可验证)
 
-| 阶段 | 内容 | 验证方式 | 风险 |
-|---|---|---|---|
-| **P1 路径治理** | core/paths.py + 20+ 处写入路径迁移 + 删 .bak | 开发环境全部功能照常 + 144 回归 | 低(行为等价重构) |
-| **P2 构建脚本** | 新 build.py(自动收集+自检) | 本机打包 + 冒烟 | 低 |
-| **P3 打包实测** | 本机运行 dist 产物,重点回归「改字符画→重启仍在」 | 手动功能清单 | 中(隐藏依赖可能漏) |
-| **P4 干净机器** | 无 Python 电脑全功能验证 | §6 清单 | 中 |
+| 阶段 | 内容 | 验证方式 | 风险 | 状态 |
+|---|---|---|---|---|
+| **P1 路径治理** | core/paths.py + 20+ 处写入路径迁移 + 删 .bak | 开发环境全部功能照常 + 144 回归 | 低(行为等价重构) | ✅ |
+| **P2 构建脚本** | 新 build.py(自动收集+自检) | 本机打包 + 冒烟 | 低 | ✅ |
+| **P3 打包实测** | 本机运行 dist 产物,重点回归「改字符画→重启仍在」 | 手动功能清单 | 中(隐藏依赖可能漏) | ✅(修复 3 个崩溃 + 2 个实测问题后通过) |
+| **P4 干净机器** | 无 Python 电脑全功能验证 | §6 清单 | 中 | ⬜ |
 
 每阶段做完停下来给你确认,再进下一阶段。
 
@@ -164,7 +164,7 @@ user_data_dir() → exe 旁 data/;写入失败自动降级 %LOCALAPPDATA%\WARFRA
 | exe 旁目录不可写(Program Files) | user_data_dir 自动降级 %LOCALAPPDATA%,并写日志说明 |
 | dxcam 打包环境异常 | P3 重点实测;dxcam 纯 win32 依赖,onedir 一般无碍 |
 | Python 3.14 + PyInstaller 兼容 | 旧构建产物里有 python314.dll,证明上次打包成功,风险低 |
-| 隐藏依赖漏(运行时 ModuleNotFoundError) | 构建脚本自动扫描全目录;冒烟测试兜底;console 保留便于看报错 |
+| 隐藏依赖漏(运行时 ModuleNotFoundError) | 构建脚本自动扫描全目录;冒烟测试兜底;崩溃详情见 data/logs/console.log |
 | exe 图标 | `icon/` 目录已不存在;需要你提供一个 `.ico`(或先用 PySide6 图标生成) |
 
 ---
@@ -181,3 +181,29 @@ user_data_dir() → exe 旁 data/;写入失败自动降级 %LOCALAPPDATA%\WARFRA
     同意
 5. **P1-P4 分期节奏**:按 §5 每阶段停下来确认,还是 P1+P2 连做后一起确认?
     按 §5 每阶段停下来确认
+
+---
+
+## 9. 执行记录(2026-09-22)
+
+### 9.1 P1 路径治理(✅)
+
+- 新建 `core/paths.py`(四件套),迁移 pixel_font/ui_prefs/trigger/hotkey/toggles/cd_assist/price_cache/background/logs/proxy 配置组 + 数据库组 + matcher/worldstate/fonts/tokens 等只读资源定位
+- 顺带修复 matcher 两处指向不存在目录的静默失效 db 路径;AST 三合一扫描(语法/未用/未定义)揪出并修复 4 处清理隐患;144 项回归全过
+
+### 9.2 P2-P3 六次打包迭代(✅)
+
+| # | 结果 | 修复内容 |
+|---|---|---|
+| 1 | 冒烟假阳性暴露 | windowed 崩溃弹错误对话框撑住进程 → smoke() 加 PIPE + stderr Traceback 检测 |
+| 2 | 冒烟 FAIL | `'NoneType' has no 'write'`:windowed 下流为 None → dev.py frozen 兜底换向 console.log |
+| 3 | 冒烟 FAIL | `UnicodeEncodeError 'gbk'`:管道/CMD 启动流有效但 GBK → frozen 时 reconfigure UTF-8;另:残留 exe 进程锁 dist → 重启前先杀 |
+| 4 | **全绿** | 排除零引用连带库(torch/torchvision/scipy/pandas/matplotlib):dist 1013MB→494MB,ZIP 360MB→**176MB**;smoke 改 taskkill /T 杀进程树(onedir bootloader 孤儿子进程问题) |
+| 5 | — | 价格页实测「列表不可用/无预选项」修复(LOADING 放行 + 15s 后台预热 + 本地 DB 降级) |
+| 6 | **全绿交付** | 一线战报实测「刷新很慢」修复(磁盘缓存秒显 + 启动 10s 预取);P3 用户实测**功能全部正常** |
+
+### 9.3 遗留事项
+
+- P4 干净机器验证(§6 清单)
+- exe 图标(用户未提供 .ico,暂不设)
+- `data/logs/console.log` 会持续增长,后续可考虑加轮转上限
