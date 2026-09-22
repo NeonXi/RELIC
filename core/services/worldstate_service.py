@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from core.paths import resource_dir as _resource_dir
+from core.paths import user_data_dir as _user_data_dir
 
 # ── 常量 ──
 
@@ -33,6 +35,10 @@ WORLDSTATE_URL = "https://api.warframe.com/cdn/worldState.php"
 
 # 节点翻译表(节点名/派系),内置,无需联网
 _NODE_FILE = _resource_dir() / "worldstate" / "solNodes.json"
+
+# 磁盘缓存(上次成功拉取的裂缝列表):启动/进页面先渲染旧数据,
+# DE 官方 API 国内访问 10-20s,无缓存会导致每次启动后首进页面白等
+_CACHE_FILE = _user_data_dir() / "worldstate_cache.json"
 
 # 自动刷新间隔(秒);裂缝每分钟有变动,60s 足够
 AUTO_REFRESH_MS = 60_000
@@ -108,8 +114,8 @@ class WorldstateService(QObject):
         # 节点翻译表 {SolNodeXX: {value, enemy, ...}}
         self._nodes: dict = self._load_node_table()
 
-        # 当前裂缝缓存
-        self._fissures: list[dict] = []
+        # 当前裂缝缓存(启动时从磁盘缓存恢复,秒显旧数据)
+        self._fissures: list[dict] = self._load_disk_cache()
 
         # 后台线程去重
         self._worker_lock = threading.Lock()
@@ -132,6 +138,10 @@ class WorldstateService(QObject):
         self._attach_count += 1
         if not self._timer.isActive():
             self._timer.start()
+        # 有磁盘缓存先发一次信号:页面立即渲染旧数据(进度条按 expiry 算,
+        # 过期项 15s 内会被下面的网络刷新覆盖),消除白等
+        if self._fissures:
+            self.fissures_changed.emit(self.get_fissures())
         # 缓存空则立即拉;有缓存也后台刷新一次保证新鲜
         self.refresh()
 
@@ -173,6 +183,7 @@ class WorldstateService(QObject):
             data = HttpClient.instance().get_json(WORLDSTATE_URL)
             fissures = self._parse_fissures(data)
             self._fissures = fissures
+            self._save_disk_cache(fissures)
             self.fissures_changed.emit(fissures)
         except Exception as e:
             self.load_failed.emit(f"{type(e).__name__}: {e}")
@@ -238,3 +249,27 @@ class WorldstateService(QObject):
                 return json.load(f)
         except Exception:
             return {}
+
+    @staticmethod
+    def _load_disk_cache() -> list[dict]:
+        """读取上次成功拉取的裂缝列表(失败/损坏返回空,静默降级)。"""
+        try:
+            with _CACHE_FILE.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            fissures = data.get("fissures", [])
+            return fissures if isinstance(fissures, list) else []
+        except Exception:
+            return []
+
+    @staticmethod
+    def _save_disk_cache(fissures: list[dict]) -> None:
+        """成功拉取后持久化,供下次启动秒显(失败静默,不影响主流程)。"""
+        try:
+            _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with _CACHE_FILE.open("w", encoding="utf-8") as f:
+                json.dump(
+                    {"saved_at": int(time.time()), "fissures": fissures},
+                    f, ensure_ascii=False,
+                )
+        except Exception:
+            pass

@@ -280,6 +280,12 @@ class PricesPage(PageBase):
         self._dropdown.itemClicked.connect(self._on_dropdown_item_clicked)
         self._dropdown.hide()
 
+        # 启动后 15s 后台预热物品列表(不等用户进页面):
+        # 首启无缓存时网络拉取约 30-60s,提前预热可消除「进页面后不可搜」窗口;
+        # warm_cache_async 幂等(有缓存且新鲜/加载中均跳过),与 on_enter 不冲突
+        QTimer.singleShot(
+            15_000, lambda: WmItemsRepository.instance().warm_cache_async()
+        )
         return container
 
     def on_enter(self) -> None:
@@ -428,10 +434,14 @@ class PricesPage(PageBase):
             return
         # 检查顶层状态
         state = PriceQueryState.instance()
-        if not state.top_status.is_search_available:
-            self._show_status_label("列表不可用,无法搜索", warn=True)
+        top = state.top_status
+        # LOADING 不拦截:Coordinator 内部会等 1s 重试,超时自动降级 DB 搜索,
+        # 保证首启列表加载窗口期(网络慢时可达 1 分钟)用户仍可搜索
+        if top is TopStatus.LOADING or top.is_search_available:
+            SearchCoordinator.instance().search_async(kw)
             return
-        SearchCoordinator.instance().search_async(kw)
+        # 仅 IDLE / FAILED(网络 + DB 都不通)才拦截
+        self._show_status_label("列表不可用,无法搜索", warn=True)
 
     def _on_search_started(self) -> None:
         _dbg("page", "_on_search_started: 显示搜索 spinner")

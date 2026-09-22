@@ -78,6 +78,11 @@ class WorldstatePage(PageBase):
         super().__init__()
         self.page_title = "一线战报"
 
+        # 启动 10s 后台预取一次裂缝数据(不等用户进页面):
+        # DE 官方 API 国内访问 10-20s,预取写入磁盘缓存后,
+        # 用户首次进页面即可秒显数据(refresh 幂等,worker 有去重锁)
+        QTimer.singleShot(10_000, WorldstateService.instance().refresh)
+
     # ══════════════════════════════════════════════════
     #  构建
     # ══════════════════════════════════════════════════

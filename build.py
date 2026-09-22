@@ -126,6 +126,13 @@ def run_build(clean: bool) -> None:
         "--exclude-module", "PyQt5",     # 铁律:新旧 Qt 绝不混用
         "--exclude-module", "PyQt6",
         "--exclude-module", "tkinter",
+        # 零引用连带库(省 ~466MB):grep 全项目无 import,
+        # PyInstaller 扫描 rapidocr/matplotlib 依赖声明时误连带
+        "--exclude-module", "torch",         # 360MB,最大浪费源
+        "--exclude-module", "torchvision",   # 11MB
+        "--exclude-module", "scipy",         # 72MB(含 scipy.libs)
+        "--exclude-module", "pandas",        # 13MB
+        "--exclude-module", "matplotlib",    # 12MB
         "--paths", str(PROJECT),
     ]
     if clean:
@@ -196,13 +203,24 @@ def smoke() -> bool:
         time.sleep(6)
         alive = proc.poll() is None
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
+        # onedir 的 exe 是 bootloader,真实应用跑在其派生的子进程里;
+        # terminate 只杀父进程,子进程会残留并锁住 dist 文件,
+        # 下次打包 rmtree 时 PermissionError → 必须杀整棵进程树。
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            capture_output=True,
+        )
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        # 兜底:父进程已先退但子进程成孤儿的情况,按映像名清理
+        # (也会顺带清掉用户上次手动测试后忘关的 exe,防打包被锁)
+        subprocess.run(
+            ["taskkill", "/IM", f"{APP_NAME}.exe", "/F"],
+            capture_output=True,
+        )
         # 子进程已终止,管道关闭,一次性读出缓冲内容
         err = b""
         if proc.stderr:
